@@ -14,6 +14,7 @@ import yaml
 import requests
 from typing import Dict, List, Optional, Tuple, Set, Union
 from dataclasses import dataclass, asdict, field
+from rich import box
 from rich.console import Console
 from rich.syntax import Syntax
 from rich.panel import Panel
@@ -909,8 +910,10 @@ class WireGuardManager:
             table = Table(
                 title="WireGuard Clients",
                 show_header=True,
+                box=box.SIMPLE,
+                expand=True,
                 header_style="bold",
-                show_lines=True
+                show_lines=True,
             )
             
             table.add_column("Name", style="bold blue")
