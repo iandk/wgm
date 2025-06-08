@@ -45,6 +45,7 @@ class WireGuardConfig:
     server_private_key: str = ''
     endpoint: str = ''
     full_tunnel: bool = False
+    dns_domain: str = ''
 
     @classmethod
     def from_dict(cls, config_dict: Dict) -> 'WireGuardConfig':
@@ -226,6 +227,10 @@ class WireGuardManager:
             # Set endpoint if not configured
             if not self.config.endpoint:
                 self.config.endpoint = self._get_server_endpoint()
+                
+            # Set DNS domain if not configured
+            if not self.config.dns_domain:
+                self.config.dns_domain = self._get_dns_domain()
 
             # Ensure forwarding is enabled
             with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
@@ -655,6 +660,11 @@ class WireGuardManager:
             dnsmasq_dir = Path('/etc/dnsmasq.d')
             dnsmasq_dir.mkdir(parents=True, exist_ok=True)
 
+            dns_domain = self.config.dns_domain
+            if not dns_domain:
+                raise ValueError("DNS domain is not set in config.yaml")
+            dns_domain_short = dns_domain.split('.')[0]
+            
             # Generate dnsmasq configuration
             config_lines = [
                 '# WireGuard VPN DNS configuration',
@@ -662,9 +672,9 @@ class WireGuardManager:
                 'port=53',
                 f'interface={self.config.wg_interface}',
                 'bind-interfaces',
-                'domain=vpn.local',
+                f'domain={dns_domain}',
                 'expand-hosts',
-                'local=/vpn.local/',
+                f'local=/{dns_domain}/',
                 'domain-needed',
                 'bogus-priv',
                 'no-resolv',
@@ -677,7 +687,7 @@ class WireGuardManager:
             # Add client host entries
             hosts_lines = []
             server_ip = self._get_server_ips().split(',')[0].split('/')[0]
-            hosts_lines.append(f"{server_ip} vpn.local gateway")
+            hosts_lines.append(f"{server_ip} {dns_domain} {dns_domain_short}")
             
             for client in self.clients.values():
                 client_ip = client.ipv4.split('/')[0]
