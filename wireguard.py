@@ -46,6 +46,7 @@ class WireGuardConfig:
     endpoint: str = ''
     full_tunnel: bool = False
     dns_domain: str = ''
+    dnsmasq_address_rules: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, config_dict: Dict) -> 'WireGuardConfig':
@@ -653,8 +654,7 @@ class WireGuardManager:
 
             # Install dnsmasq if not present
             if not Path('/usr/sbin/dnsmasq').exists():
-                self._run_command(['apt', 'update'])
-                self._run_command(['apt', 'install', '-y', 'dnsmasq'])
+                raise ValueError("dnsmasq is not installed")
 
             # Create dnsmasq config directory
             dnsmasq_dir = Path('/etc/dnsmasq.d')
@@ -664,6 +664,7 @@ class WireGuardManager:
             if not dns_domain:
                 raise ValueError("DNS domain is not set in config.yaml")
             dns_domain_short = dns_domain.split('.')[0]
+            
             
             # Generate dnsmasq configuration
             config_lines = [
@@ -679,10 +680,16 @@ class WireGuardManager:
                 'bogus-priv',
                 'no-resolv',
                 'no-poll',
-                'server=8.8.8.8',
-                'server=8.8.4.4',
-                ''  # End with newline
+                'server=1.1.1.1',
+                'server=1.0.0.1',
             ]
+
+            # Add custom address rules from config
+            if self.config.dnsmasq_address_rules:
+                for rule in self.config.dnsmasq_address_rules:
+                    config_lines.append(f"address={rule}")
+
+            config_lines.append('')  # End with newline
 
             # Add client host entries
             hosts_lines = []
