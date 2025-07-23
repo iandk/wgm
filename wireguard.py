@@ -31,6 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 console = Console()
 
+
 @dataclass
 class WireGuardConfig:
     """WireGuard server configuration."""
@@ -45,10 +46,13 @@ class WireGuardConfig:
     server_private_key: str = ''
     endpoint: str = ''
     full_tunnel: bool = False
+    dns_domain: str = ''
+    dnsmasq_address_rules: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, config_dict: Dict) -> 'WireGuardConfig':
         return cls(**{k: v for k, v in config_dict.items() if k in cls.__annotations__})
+
 
 @dataclass
 class WireGuardClient:
@@ -62,17 +66,18 @@ class WireGuardClient:
     restricted_ip6s: List[str] = field(default_factory=list)  # IPv6 restrictions
     created_at: str = ''
 
+
 class WireGuardManager:
     """Manages WireGuard VPN server and clients."""
-    
+
     def __init__(self, config_path: str = 'config.yaml'):
         # Get the directory where the script is located, following symlinks
         self.script_dir = Path(os.path.realpath(__file__)).parent.resolve()
-        
+
         # Use absolute paths based on script location
         self.config_path = (self.script_dir / config_path).resolve()
         self.clients_file = self.script_dir / 'clients.json'
-        
+
         self.config = self._load_config()
         self.clients: Dict[str, WireGuardClient] = {}
         self._load_clients()
@@ -121,8 +126,8 @@ class WireGuardManager:
         except Exception as e:
             logger.error(f"Failed to save clients: {e}")
 
-    def _run_command(self, cmd: List[str], input_data: str = None, 
-                    timeout: int = 30) -> str:
+    def _run_command(self, cmd: List[str], input_data: str = None,
+                     timeout: int = 30) -> str:
         """Run system command with timeout."""
         try:
             if input_data:
@@ -138,12 +143,12 @@ class WireGuardManager:
                     capture_output=True,
                     timeout=timeout
                 )
-            
+
             if result.returncode != 0:
                 raise subprocess.CalledProcessError(
                     result.returncode, cmd, result.stdout, result.stderr
                 )
-            
+
             return result.stdout.decode().strip()
         except subprocess.TimeoutExpired:
             logger.error(f"Command timed out after {timeout}s: {' '.join(cmd)}")
@@ -185,10 +190,10 @@ class WireGuardManager:
         """Get next available IPs for a new client."""
         ipv4_net = ipaddress.ip_network(self.config.ipv4_subnet)
         ipv6_net = ipaddress.ip_network(self.config.ipv6_subnet)
-        
+
         used_ipv4s = {client.ipv4.split('/')[0] for client in self.clients.values()}
         used_ipv6s = {client.ipv6.split('/')[0] for client in self.clients.values()}
-        
+
         # Skip first IP (reserved for server)
         for ip in list(ipv4_net.hosts())[1:]:
             if str(ip) not in used_ipv4s:
@@ -196,13 +201,13 @@ class WireGuardManager:
                 break
         else:
             raise ValueError(f"No available IPv4s in subnet {self.config.ipv4_subnet}")
-        
+
         next_ip = ipv6_net.network_address + 2
         while str(next_ip) in used_ipv6s:
             next_ip += 1
             if next_ip not in ipv6_net:
                 raise ValueError(f"No available IPv6s in subnet {self.config.ipv6_subnet}")
-        
+
         next_ipv6 = f"{next_ip}/{ipv6_net.prefixlen}"
         return {'ipv4': next_ipv4, 'ipv6': next_ipv6}
 
@@ -227,6 +232,10 @@ class WireGuardManager:
             if not self.config.endpoint:
                 self.config.endpoint = self._get_server_endpoint()
 
+            # Set DNS domain if not configured
+            if not self.config.dns_domain:
+                self.config.dns_domain = self._get_dns_domain()
+
             # Ensure forwarding is enabled
             with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
                 f.write('1\n')
@@ -239,15 +248,15 @@ class WireGuardManager:
                 "net.ipv4.ip_forward=1\n"
                 "net.ipv6.conf.all.forwarding=1\n"
             )
-            
+
             self._ensure_persistent_firewall()
             self._save_config()
             self._update_server_config()
-            
+
             # Verify interface is up
             if not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
                 raise RuntimeError("Failed to create WireGuard interface")
-                
+
             console.print("[green]Server initialized successfully[/green]")
         except Exception as e:
             logger.error(f"Failed to initialize server: {e}")
@@ -276,7 +285,7 @@ class WireGuardManager:
         try:
             client_ip = client.ipv4.split('/')[0]
             client_ip6 = client.ipv6.split('/')[0]
-            
+
             # Clean up existing IPv4 rules
             try:
                 iptables_list = self._run_command(['iptables', '-L', 'FORWARD', '--line-numbers'])
@@ -307,7 +316,7 @@ class WireGuardManager:
                         '-d', dest_ip,
                         '-j', 'ACCEPT'
                     ])
-                
+
                 self._run_command([
                     'iptables', '-A', 'FORWARD',
                     '-i', self.config.wg_interface,
@@ -325,7 +334,7 @@ class WireGuardManager:
                         '-d', dest_ip,
                         '-j', 'ACCEPT'
                     ])
-                
+
                 self._run_command([
                     'ip6tables', '-A', 'FORWARD',
                     '-i', self.config.wg_interface,
@@ -387,13 +396,13 @@ class WireGuardManager:
             self._run_command(['wg-quick', 'up', self.config.wg_interface])
 
             # Add default forward rules (only for unrestricted clients)
-            unrestricted_clients = [client for client in self.clients.values() 
-                                  if not client.restricted_ips and not client.restricted_ip6s]
-            
+            unrestricted_clients = [client for client in self.clients.values()
+                                    if not client.restricted_ips and not client.restricted_ip6s]
+
             for client in unrestricted_clients:
                 client_ip = client.ipv4.split('/')[0]
                 client_ip6 = client.ipv6.split('/')[0]
-                
+
                 # Add IPv4 rules
                 self._run_command([
                     'iptables', '-A', 'FORWARD',
@@ -407,7 +416,7 @@ class WireGuardManager:
                     '-d', client_ip,
                     '-j', 'ACCEPT'
                 ])
-                
+
                 # Add IPv6 rules
                 self._run_command([
                     'ip6tables', '-A', 'FORWARD',
@@ -423,8 +432,8 @@ class WireGuardManager:
                 ])
 
             # Update firewall rules for all restricted clients
-            restricted_clients = [client for client in self.clients.values() 
-                                if client.restricted_ips or client.restricted_ip6s]
+            restricted_clients = [client for client in self.clients.values()
+                                  if client.restricted_ips or client.restricted_ip6s]
             for client in restricted_clients:
                 self._update_client_firewall_rules(client)
 
@@ -438,23 +447,23 @@ class WireGuardManager:
         except Exception as e:
             logger.error(f"Failed to update server config: {e}")
             raise
-                
+
     def _get_server_ips(self) -> str:
         """Get server IPs from subnet."""
         ipv4_net = ipaddress.ip_network(self.config.ipv4_subnet)
         ipv6_net = ipaddress.ip_network(self.config.ipv6_subnet)
-        
+
         return (
             f"{next(ipv4_net.hosts())}/{ipv4_net.prefixlen}, "
             f"{ipv6_net.network_address + 1}/{ipv6_net.prefixlen}"
         )
 
-    def update_client_restrictions(self, name: str, 
-                                 add_ips: Optional[List[str]] = None,
-                                 remove_ips: Optional[List[str]] = None,
-                                 add_ip6s: Optional[List[str]] = None,
-                                 remove_ip6s: Optional[List[str]] = None,
-                                 clear_all: bool = False) -> None:
+    def update_client_restrictions(self, name: str,
+                                   add_ips: Optional[List[str]] = None,
+                                   remove_ips: Optional[List[str]] = None,
+                                   add_ip6s: Optional[List[str]] = None,
+                                   remove_ip6s: Optional[List[str]] = None,
+                                   clear_all: bool = False) -> None:
         """Update IP restrictions for a client."""
         try:
             if name not in self.clients:
@@ -510,13 +519,16 @@ class WireGuardManager:
         except Exception as e:
             logger.error(f"Failed to update client restrictions: {e}")
             raise
-        
+
     def _create_install_command(self, client_config: str, interface_name: str = 'wg0') -> str:
         """Create installation command using base64 encoding with line wrapping."""
         install_script = (
             f"apt update && "
-            f"apt install -y wireguard && "
-            f"wg-quick down {interface_name} || true && "
+            f"apt install -y wireguard resolvconf && "
+            f"echo 'nameserver 1.1.1.1' > /etc/resolvconf/resolv.conf.d/head &&"
+            f"echo 'nameserver 1.0.0.1' >> /etc/resolvconf/resolv.conf.d/head &&"
+            f"resolvconf -u &&"
+            f"wg-quick down {interface_name} 2>/dev/null || true && "
             f"rm -f /etc/wireguard/{interface_name}.conf && "
             f"cat > /etc/wireguard/{interface_name}.conf << EOF\n"
             f"{client_config}\n"
@@ -525,17 +537,17 @@ class WireGuardManager:
             f"systemctl enable wg-quick@{interface_name} && "
             f"wg-quick up {interface_name}"
         )
-        
+
         # Encode the script and wrap at 50 characters
         encoded = base64.b64encode(install_script.encode()).decode()
         wrapped = '\\\n'.join([encoded[i:i+50] for i in range(0, len(encoded), 50)])
-        
+
         # Return wrapped command
         return f"echo \\\n{wrapped} | base64 -d | sudo bash"
-       
+
     def add_client(self, name: str, full_tunnel: Optional[bool] = None,
-                restricted_ips: Optional[List[str]] = None,
-                restricted_ip6s: Optional[List[str]] = None) -> None:
+                   restricted_ips: Optional[List[str]] = None,
+                   restricted_ip6s: Optional[List[str]] = None) -> None:
         """Add a new WireGuard client."""
         try:
             if name in self.clients:
@@ -560,7 +572,7 @@ class WireGuardManager:
             # Generate client keys and get IPs
             private_key, public_key = self._generate_keypair()
             ips = self._get_next_available_ips()
-            
+
             # Set tunnel mode
             use_full_tunnel = full_tunnel if full_tunnel is not None else self.config.full_tunnel
             allowed_ips = ['0.0.0.0/0', '::/0'] if use_full_tunnel else [
@@ -582,7 +594,7 @@ class WireGuardManager:
 
             # Generate client config
             config_content = self._create_client_config(client, private_key)
-            
+
             # Save client config
             config_path = Path(self.config.config_dir) / f"{name}.conf"
             config_path.write_text(config_content)
@@ -590,7 +602,7 @@ class WireGuardManager:
 
             # Ensure QR directory exists
             Path(self.config.qr_dir).mkdir(parents=True, exist_ok=True)
-            
+
             # Generate QR code using qrencode
             qr_path = Path(self.config.qr_dir) / f"{name}_qr.png"
             try:
@@ -617,43 +629,47 @@ class WireGuardManager:
         except Exception as e:
             logger.error(f"Failed to add client: {e}")
             raise
-                
+
     def _update_dns_config(self) -> None:
         """Update DNS configuration for client name resolution."""
         try:
             # First, handle any existing DNS services
             try:
                 # Check if systemd-resolved is active
-                result = subprocess.run(['systemctl', 'is-active', 'systemd-resolved'], 
-                                     capture_output=True, text=True)
+                result = subprocess.run(['systemctl', 'is-active', 'systemd-resolved'],
+                                        capture_output=True, text=True)
                 if result.stdout.strip() == 'active':
                     self._run_command(['systemctl', 'stop', 'systemd-resolved'])
                     self._run_command(['systemctl', 'disable', 'systemd-resolved'])
-                
+
                 # Kill any existing dnsmasq processes
                 self._run_command(['killall', 'dnsmasq'], timeout=5)
             except subprocess.CalledProcessError:
                 # It's okay if these fail (services might not exist)
                 pass
-                
+
             # Wait for WireGuard interface to be up
             retries = 5
             while retries > 0 and not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
                 time.sleep(1)
                 retries -= 1
-            
+
             if not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
                 logger.warning(f"WireGuard interface {self.config.wg_interface} not found")
                 return
 
             # Install dnsmasq if not present
             if not Path('/usr/sbin/dnsmasq').exists():
-                self._run_command(['apt', 'update'])
-                self._run_command(['apt', 'install', '-y', 'dnsmasq'])
+                raise ValueError("dnsmasq is not installed")
 
             # Create dnsmasq config directory
             dnsmasq_dir = Path('/etc/dnsmasq.d')
             dnsmasq_dir.mkdir(parents=True, exist_ok=True)
+
+            dns_domain = self.config.dns_domain
+            if not dns_domain:
+                raise ValueError("DNS domain is not set in config.yaml")
+            dns_domain_short = dns_domain.split('.')[0]
 
             # Generate dnsmasq configuration
             config_lines = [
@@ -662,23 +678,29 @@ class WireGuardManager:
                 'port=53',
                 f'interface={self.config.wg_interface}',
                 'bind-interfaces',
-                'domain=vpn.local',
+                f'domain={dns_domain}',
                 'expand-hosts',
-                'local=/vpn.local/',
+                f'local=/{dns_domain}/',
                 'domain-needed',
                 'bogus-priv',
                 'no-resolv',
                 'no-poll',
-                'server=8.8.8.8',
-                'server=8.8.4.4',
-                ''  # End with newline
+                'server=1.1.1.1',
+                'server=1.0.0.1',
             ]
+
+            # Add custom address rules from config
+            if self.config.dnsmasq_address_rules:
+                for rule in self.config.dnsmasq_address_rules:
+                    config_lines.append(f"address={rule}")
+
+            config_lines.append('')  # End with newline
 
             # Add client host entries
             hosts_lines = []
             server_ip = self._get_server_ips().split(',')[0].split('/')[0]
-            hosts_lines.append(f"{server_ip} vpn.local gateway")
-            
+            hosts_lines.append(f"{server_ip} {dns_domain} {dns_domain_short}")
+
             for client in self.clients.values():
                 client_ip = client.ipv4.split('/')[0]
                 client_ip6 = client.ipv6.split('/')[0]
@@ -692,7 +714,7 @@ class WireGuardManager:
             # Clean up old config files
             config_path = dnsmasq_dir / 'wireguard.conf'
             hosts_path = Path('/etc/hosts.wireguard')
-            
+
             # Write new config files
             config_path.write_text('\n'.join(config_lines))
             hosts_path.write_text('\n'.join(hosts_lines))
@@ -702,9 +724,9 @@ class WireGuardManager:
             if dnsmasq_conf.exists():
                 current_config = dnsmasq_conf.read_text()
                 # Remove any existing WireGuard related config
-                new_lines = [line for line in current_config.splitlines() 
-                        if not any(x in line for x in ['WireGuard', str(hosts_path), str(config_path)])]
-                
+                new_lines = [line for line in current_config.splitlines()
+                             if not any(x in line for x in ['WireGuard', str(hosts_path), str(config_path)])]
+
                 # Add our configuration
                 new_lines.extend([
                     '',
@@ -713,7 +735,7 @@ class WireGuardManager:
                     f'conf-file={config_path}',
                     ''  # End with newline
                 ])
-                
+
                 dnsmasq_conf.write_text('\n'.join(new_lines))
             else:
                 dnsmasq_conf.write_text('\n'.join([
@@ -728,15 +750,15 @@ class WireGuardManager:
                 # First stop
                 self._run_command(['systemctl', 'stop', 'dnsmasq'])
                 time.sleep(2)  # Give it time to fully stop
-                
+
                 # Then start
                 self._run_command(['systemctl', 'start', 'dnsmasq'])
-                
+
                 # Verify it's running
                 status = self._run_command(['systemctl', 'is-active', 'dnsmasq'])
                 if status != 'active':
                     raise RuntimeError(f"dnsmasq failed to start, status: {status}")
-                    
+
             except Exception as e:
                 logger.error(f"Failed to restart dnsmasq: {e}")
                 # Try to get more detailed error information
@@ -755,7 +777,7 @@ class WireGuardManager:
         """Create client configuration."""
         # Get server IP for DNS
         server_ip = self._get_server_ips().split(',')[0].split('/')[0]
-            
+
         return '\n'.join([
             '[Interface]',
             f'PrivateKey = {private_key}',
@@ -769,10 +791,10 @@ class WireGuardManager:
             'PersistentKeepalive = 10',
             ''  # Add empty string to create final newline
         ])
-        
+
     def show_client_config(self, name: str, config_content: Optional[str] = None, show_qr: bool = False) -> None:
         """Show configuration details for a client.
-        
+
         Args:
             name: Client name
             config_content: Optional pre-generated config content (for new clients)
@@ -797,7 +819,7 @@ class WireGuardManager:
             console.print("\n[bold blue]Configuration Files:[/bold blue]")
             console.print(f"Config file: {config_path}")
             console.print(f"QR code: {qr_path}")
-            
+
             # Also display QR code in terminal
             if show_qr:
                 try:
@@ -811,17 +833,17 @@ class WireGuardManager:
                     print(qr_terminal.stdout)
                 except Exception as e:
                     logger.warning(f"Failed to generate terminal QR code: {e}")
-            
+
             console.print("\n[bold blue]Installation Command:[/bold blue]")
             # print(install_command)
             # console.print(Syntax(install_command, "bash", word_wrap=False, theme="github-dark"))
             # console.print(Syntax(install_command, "bash", word_wrap=False, line_numbers=False))
             console.print(install_command, style="white on black")
             # console.print(install_command)
-            
+
             console.print("\n[bold blue]Configuration Content:[/bold blue]")
             config_content = config_content.rstrip()
-            console.print(Syntax(config_content, "ini", theme="github-dark"))  
+            console.print(Syntax(config_content, "ini", theme="github-dark"))
 
             # Show restrictions if client exists
             if name in self.clients:
@@ -830,13 +852,13 @@ class WireGuardManager:
                     restrictions = []
                     restrictions.extend(client.restricted_ips)
                     restrictions.extend(client.restricted_ip6s)
-                    console.print("\n[yellow]IP restrictions:[/yellow] " + 
-                                ", ".join(restrictions))
+                    console.print("\n[yellow]IP restrictions:[/yellow] " +
+                                  ", ".join(restrictions))
 
         except Exception as e:
             logger.error(f"Failed to show client configuration: {e}")
             raise
-        
+
     def remove_client(self, name: str, skip_confirm: bool = False) -> None:
         """Remove a WireGuard client."""
         try:
@@ -871,14 +893,14 @@ class WireGuardManager:
         except Exception as e:
             logger.error(f"Failed to remove client: {e}")
             raise
-        
+
     def _get_client_status(self) -> Dict[str, Dict[str, str]]:
         """Get status information for all clients from wg command."""
         try:
             wg_output = self._run_command(['wg', 'show', self.config.wg_interface])
             current_peer = None
             peer_info = {}
-            
+
             for line in wg_output.split('\n'):
                 line = line.strip()
                 if line.startswith('peer:'):
@@ -891,7 +913,7 @@ class WireGuardManager:
                         if 'minutes' not in handshake_time or int(handshake_time.split()[0]) <= 3:
                             peer_info[current_peer]['status'] = 'Online'
                         peer_info[current_peer]['last_seen'] = handshake_time
-            
+
             return peer_info
         except Exception as e:
             logger.warning(f"Failed to get client status: {e}")
@@ -915,7 +937,7 @@ class WireGuardManager:
                 header_style="bold",
                 show_lines=True,
             )
-            
+
             table.add_column("Name", style="bold blue")
             table.add_column("Status", style="")
             table.add_column("Addresses", style="")
@@ -931,7 +953,7 @@ class WireGuardManager:
                 tunnel_mode = "[blue]Full[/blue]" if "0.0.0.0/0" in client.allowed_ips else "[yellow]Split[/yellow]"
                 # in german format
                 created = datetime.fromisoformat(client.created_at).strftime("%d.%m.%Y %H:%M") if client.created_at else "Unknown"
-                
+
                 # Get status info for this client
                 status = "Unknown"
                 last_seen = "Never"
@@ -948,23 +970,23 @@ class WireGuardManager:
                 if client.restricted_ip6s:
                     restrictions.extend(client.restricted_ip6s)
                 restriction_text = ", ".join(restrictions) if restrictions else "[dim]None[/dim]"
-                
+
                 # Set status style
                 status_display = f"● {status}"
                 if status == "Online":
                     status_display = f"[green]{status_display}[/green]"
                 else:
                     status_display = f"[red]{status_display}[/red]"
-                
+
                 # Addresses
                 addresses = []
                 if client.ipv4:
                     addresses.append(client.ipv4)
                 if client.ipv6:
                     addresses.append(client.ipv6)
-                    
+
                 addresses_text = "\n".join(addresses) if addresses else "Unknown"
-                
+
                 table.add_row(
                     name,
                     status_display,
@@ -973,31 +995,32 @@ class WireGuardManager:
                     restriction_text,
                     last_seen,
                     created
-                )        
+                )
 
             console.print(table)
 
         except Exception as e:
             logger.error(f"Failed to list clients: {e}")
             raise
-        
+
+
 def main():
     parser = argparse.ArgumentParser(description="WireGuard VPN Manager")
     parser.add_argument("-c", "--config", default="config.yaml", help="Path to config file")
-    
+
     subparsers = parser.add_subparsers(dest="command", required=True)
-    
+
     # Initialize command
     subparsers.add_parser("init", help="Initialize WireGuard server")
-    
+
     # Add client command
     add_parser = subparsers.add_parser("add", help="Add a new client")
     add_parser.add_argument("name", help="Client name")
     add_parser.add_argument("--full-tunnel", action="store_true", help="Use full tunnel mode")
     add_parser.add_argument("--split-tunnel", action="store_true", help="Use split tunnel mode")
-    add_parser.add_argument("--restrict-to", nargs="+", metavar="IP", 
-        help="List of IP addresses/networks this client can access (both IPv4 and IPv6)")
-    
+    add_parser.add_argument("--restrict-to", nargs="+", metavar="IP",
+                            help="List of IP addresses/networks this client can access (both IPv4 and IPv6)")
+
     # Show config command
     config_parser = subparsers.add_parser("config", help="Show client configuration details")
     config_parser.add_argument("name", help="Client name")
@@ -1006,34 +1029,34 @@ def main():
     remove_parser = subparsers.add_parser("remove", help="Remove a client")
     remove_parser.add_argument("name", help="Client name")
     remove_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
-    
+
     # List clients command
     subparsers.add_parser("list", help="List all clients")
-    
+
     # Manage restrictions command
     restrict_parser = subparsers.add_parser("restrict", help="Manage client IP restrictions")
     restrict_parser.add_argument("name", help="Client name")
     restrict_parser.add_argument("--allow", nargs="+", metavar="IP",
-        help="Add IP addresses/networks to allowed list")
+                                 help="Add IP addresses/networks to allowed list")
     restrict_parser.add_argument("--deny", nargs="+", metavar="IP",
-        help="Remove IP addresses/networks from allowed list")
+                                 help="Remove IP addresses/networks from allowed list")
     restrict_parser.add_argument("--clear", action="store_true",
-        help="Remove all IP restrictions")
-    
+                                 help="Remove all IP restrictions")
+
     args = parser.parse_args()
 
     try:
         manager = WireGuardManager(args.config)
-        
+
         if args.command == "init":
             manager.initialize()
-        
+
         elif args.command == "add":
             if args.full_tunnel and args.split_tunnel:
                 console.print("[red]Cannot specify both --full-tunnel and --split-tunnel[/red]")
                 sys.exit(1)
             full_tunnel = True if args.full_tunnel else False if args.split_tunnel else None
-            
+
             # Split IPs into v4 and v6 automatically
             if args.restrict_to:
                 ipv4_list = []
@@ -1051,27 +1074,27 @@ def main():
                 manager.add_client(args.name, full_tunnel, ipv4_list, ipv6_list)
             else:
                 manager.add_client(args.name, full_tunnel)
-        
+
         elif args.command == "config":
             manager.show_client_config(args.name, show_qr=args.show_qr)
-        
+
         elif args.command == "remove":
             manager.remove_client(args.name, skip_confirm=args.yes)
-        
+
         elif args.command == "list":
             manager.list_clients()
-            
+
         elif args.command == "restrict":
             if not any([args.allow, args.deny, args.clear]):
                 console.print("[red]Please specify at least one action: --allow, --deny, or --clear[/red]")
                 sys.exit(1)
-                
+
             # Process restrictions
             add_ipv4 = []
             add_ipv6 = []
             remove_ipv4 = []
             remove_ipv6 = []
-            
+
             if args.allow:
                 for ip in args.allow:
                     try:
@@ -1083,7 +1106,7 @@ def main():
                     except ValueError as e:
                         console.print(f"[red]Invalid IP address/network: {ip}[/red]")
                         sys.exit(1)
-                        
+
             if args.deny:
                 for ip in args.deny:
                     try:
@@ -1095,7 +1118,7 @@ def main():
                     except ValueError as e:
                         console.print(f"[red]Invalid IP address/network: {ip}[/red]")
                         sys.exit(1)
-            
+
             manager.update_client_restrictions(
                 args.name,
                 add_ips=add_ipv4,
@@ -1109,6 +1132,6 @@ def main():
         console.print(f"[red]Error: {str(e)}[/red]")
         sys.exit(1)
 
+
 if __name__ == "__main__":
     main()
-
