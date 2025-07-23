@@ -689,13 +689,14 @@ class WireGuardManager:
                 'server=1.0.0.1',
             ]
 
+
             # Add custom address rules from config
             if self.config.dnsmasq_address_rules:
                 for rule in self.config.dnsmasq_address_rules:
                     config_lines.append(f"address={rule}")
 
             config_lines.append('')  # End with newline
-
+            
             # Add client host entries
             hosts_lines = []
             server_ip = self._get_server_ips().split(',')[0].split('/')[0]
