@@ -186,6 +186,17 @@ class WireGuardManager:
             s.close()
             return local_ip
 
+    def _get_dns_domain(self) -> str:
+        """Get a default DNS domain if not set."""
+        try:
+            fqdn = socket.getfqdn()
+            # Check for a reasonably valid FQDN
+            if fqdn and '.' in fqdn and not fqdn.endswith('.internal') and not fqdn.endswith('.localdomain'):
+                return fqdn
+        except Exception:
+            pass  # Fallback to default
+        return 'vpn.local'
+
     def _get_next_available_ips(self) -> Dict[str, str]:
         """Get next available IPs for a new client."""
         ipv4_net = ipaddress.ip_network(self.config.ipv4_subnet)
@@ -280,6 +291,33 @@ class WireGuardManager:
         except Exception as e:
             logger.warning(f"Failed to ensure persistent firewall: {e}")
 
+    def _flush_forward_rules(self) -> None:
+        """Flush all WireGuard-related FORWARD rules to prevent duplication."""
+        logger.debug("Flushing old WireGuard FORWARD rules using iptables-restore.")
+        try:
+            # For IPv4
+            iptables_dump = self._run_command(['iptables-save'])
+            # Keep all lines except those that are FORWARD rules for our wg interface
+            filtered_rules = [
+                line for line in iptables_dump.split('\n')
+                if not (line.startswith('-A FORWARD') and self.config.wg_interface in line)
+            ]
+            self._run_command(['iptables-restore'], input_data='\n'.join(filtered_rules))
+            logger.debug("Successfully flushed old IPv4 FORWARD rules.")
+
+            # For IPv6
+            ip6tables_dump = self._run_command(['ip6tables-save'])
+            filtered_rules_6 = [
+                line for line in ip6tables_dump.split('\n')
+                if not (line.startswith('-A FORWARD') and self.config.wg_interface in line)
+            ]
+            self._run_command(['ip6tables-restore'], input_data='\n'.join(filtered_rules_6))
+            logger.debug("Successfully flushed old IPv6 FORWARD rules.")
+
+        except Exception as e:
+            logger.error(f"Failed to flush old FORWARD rules: {e}")
+            raise  # Re-raise, as this is critical for preventing rule duplication
+
     def _update_client_firewall_rules(self, client: WireGuardClient) -> None:
         """Update firewall rules for a specific client."""
         try:
@@ -366,9 +404,17 @@ class WireGuardManager:
                 '# Enable IP forwarding and NAT',
                 'PostUp = sysctl -w net.ipv4.ip_forward=1; '
                 'sysctl -w net.ipv6.conf.all.forwarding=1; '
+                f'iptables -A FORWARD -i %i -o %i -j ACCEPT; '
+                f'ip6tables -A FORWARD -i %i -o %i -j ACCEPT; '
+                f'iptables -t nat -A POSTROUTING -s {self.config.ipv4_subnet} -d {self.config.ipv4_subnet} -o %i -j MASQUERADE; '
+                f'ip6tables -t nat -A POSTROUTING -s {self.config.ipv6_subnet} -d {self.config.ipv6_subnet} -o %i -j MASQUERADE; '
                 f'iptables -t nat -A POSTROUTING -o {self.config.interface_name} -j MASQUERADE; '
                 f'ip6tables -t nat -A POSTROUTING -o {self.config.interface_name} -j MASQUERADE',
                 'PostDown = '
+                f'iptables -D FORWARD -i %i -o %i -j ACCEPT; '
+                f'ip6tables -D FORWARD -i %i -o %i -j ACCEPT; '
+                f'iptables -t nat -D POSTROUTING -s {self.config.ipv4_subnet} -d {self.config.ipv4_subnet} -o %i -j MASQUERADE; '
+                f'ip6tables -t nat -D POSTROUTING -s {self.config.ipv6_subnet} -d {self.config.ipv6_subnet} -o %i -j MASQUERADE; '
                 f'iptables -t nat -D POSTROUTING -o {self.config.interface_name} -j MASQUERADE; '
                 f'ip6tables -t nat -D POSTROUTING -o {self.config.interface_name} -j MASQUERADE'
             ]
@@ -391,6 +437,9 @@ class WireGuardManager:
             config_path = Path(self.config.config_dir) / f"{self.config.wg_interface}.conf"
             config_path.write_text('\n'.join(config_lines))
             config_path.chmod(0o600)
+
+            # Flush all old FORWARD rules before adding new ones
+            self._flush_forward_rules()
 
             # Start interface
             self._run_command(['wg-quick', 'up', self.config.wg_interface])
@@ -870,9 +919,6 @@ class WireGuardManager:
             # Confirm deletion unless skip_confirm is True
             if not skip_confirm and not Confirm.ask(f"Are you sure you want to remove client {name}?"):
                 return
-
-            # Clean up firewall rules before removing client
-            self._update_client_firewall_rules(self.clients[name])
 
             # Remove client config file
             config_path = Path(self.config.config_dir) / f"{name}.conf"
