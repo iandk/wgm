@@ -574,8 +574,6 @@ class WireGuardManager:
         install_script = (
             f"apt update && "
             f"apt install -y wireguard resolvconf && "
-            f"echo 'nameserver 1.1.1.1' > /etc/resolvconf/resolv.conf.d/head &&"
-            f"echo 'nameserver 1.0.0.1' >> /etc/resolvconf/resolv.conf.d/head &&"
             f"resolvconf -u &&"
             f"wg-quick down {interface_name} 2>/dev/null || true && "
             f"rm -f /etc/wireguard/{interface_name}.conf && "
