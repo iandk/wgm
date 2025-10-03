@@ -1,12 +1,59 @@
 #!/bin/bash
+set -euo pipefail
 
-# Install dependencies
-apt install python3-pip python3-yaml python3-qrcode python3-rich python3-click wireguard jq qrencode catimg iptables-persistent dnsmasq
+log() {
+    echo "=> $1"
+}
 
-# Create symlink for wgm
-ln -s /opt/wgm/wireguard.py /usr/local/bin/wgm
+check_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        log "This script must be run as root."
+        exit 1
+    fi
+}
 
-# Initialize wgm
-wgm init
+main() {
+    export DEBIAN_FRONTEND=noninteractive
+    check_root
+    
+    log "Installing dependencies..."
+    apt-get update
+    apt-get install -y \
+        python3-pip \
+        python3-yaml \
+        python3-qrcode \
+        python3-rich \
+        python3-click \
+        wireguard \
+        jq \
+        qrencode \
+        catimg \
+        iptables-persistent \
+        dnsmasq
 
-echo "Installation complete! Please run 'wgm -h' to get started. Also see the configuration file at /opt/wgm/config.yaml for more information."
+    log "Creating symlink for wgm..."
+    ln -sf /opt/wgm/wireguard.py /usr/local/bin/wgm
+
+    log "Configuring dnsmasq to depend on WireGuard..."
+    mkdir -p /etc/systemd/system/dnsmasq.service.d
+    cat > /etc/systemd/system/dnsmasq.service.d/override.conf << 'EOF'
+[Unit]
+After=wg-quick@wg0.service network-online.target
+Wants=wg-quick@wg0.service network-online.target
+Before=
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    log "Reloading systemd and restarting dnsmasq..."
+    systemctl daemon-reload
+    systemctl restart dnsmasq
+
+    log "Initializing wgm..."
+    wgm init
+
+    log "Installation complete! Please run 'wgm -h' to get started."
+    log "See the configuration file at /opt/wgm/config.yaml for more information."
+}
+
+main "$@"
