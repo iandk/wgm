@@ -110,24 +110,51 @@ WantedBy=multi-user.target
 EOF
 }
 
+get_dns_domain() {
+    # Try to read dns_domain from config.yaml
+    local config_file="/opt/wgm/config.yaml"
+    local domain="vpn.local"  # default
+
+    if [[ -f "$config_file" ]]; then
+        # Extract dns_domain from YAML (simple grep approach)
+        local config_domain=$(grep -E "^dns_domain:" "$config_file" | sed -E "s/^dns_domain:\s*['\"]?([^'\"]+)['\"]?/\1/" | tr -d "'" | tr -d '"' | xargs)
+        if [[ -n "$config_domain" ]]; then
+            domain="$config_domain"
+        fi
+    fi
+
+    echo "$domain"
+}
+
+update_resolv_conf() {
+    local dns_domain=$(get_dns_domain)
+
+    log "Configuring /etc/resolv.conf with DNS domain: $dns_domain"
+
+    # Remove immutable flag if present
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+
+    # Replace symlinked resolv.conf with static one
+    if [[ -L /etc/resolv.conf ]]; then
+        rm -f /etc/resolv.conf
+    fi
+
+    cat > /etc/resolv.conf << EOF
+nameserver 127.0.0.1
+search $dns_domain
+nameserver 1.1.1.1
+EOF
+
+    # Make it immutable to prevent services from modifying it
+    chattr +i /etc/resolv.conf 2>/dev/null || warn "Could not make resolv.conf immutable"
+}
+
 disable_systemd_resolved() {
     if systemctl is-active --quiet systemd-resolved.service; then
         log "Disabling systemd-resolved to prevent DNS port conflict..."
         systemctl stop systemd-resolved
         systemctl disable systemd-resolved
-
-        # Replace symlinked resolv.conf with static one
-        if [[ -L /etc/resolv.conf ]]; then
-            rm -f /etc/resolv.conf
-        fi
-
-        cat > /etc/resolv.conf << 'EOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-EOF
-
-        # Make it immutable to prevent services from modifying it
-        chattr +i /etc/resolv.conf 2>/dev/null || warn "Could not make resolv.conf immutable"
+        update_resolv_conf
     fi
 }
 
@@ -164,6 +191,9 @@ main() {
     disable_systemd_resolved
     restart_services
     create_config
+
+    # Update resolv.conf after config is created (in case dns_domain is customized)
+    update_resolv_conf
 
     echo
     log "${GREEN}Installation complete!${NC}"

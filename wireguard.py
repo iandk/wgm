@@ -263,6 +263,9 @@ class WireGuardManager:
                 if stored_hash != current_hash:
                     console.print("[yellow]Configuration changes detected, updating...[/yellow]")
 
+                    # Update /etc/resolv.conf with new DNS domain
+                    self._update_resolv_conf()
+
                     # Update DNS configuration
                     if self.clients:
                         self._update_dns_config()
@@ -274,7 +277,8 @@ class WireGuardManager:
                     self.config_hash_file.write_text(current_hash)
                     console.print("[green]Configuration updated successfully![/green]")
             else:
-                # First run, save hash
+                # First run, save hash and update resolv.conf
+                self._update_resolv_conf()
                 self.config_hash_file.write_text(current_hash)
 
         except Exception as e:
@@ -800,6 +804,10 @@ class WireGuardManager:
     def _create_install_command(self, client_config: str, interface_name: str = 'wg0') -> str:
         """Create installation command using base64 encoding with line wrapping."""
         install_script = (
+            f"echo 'nameserver 1.1.1.1' > /tmp/resolv.conf.wgm && "
+            f"mount --bind /tmp/resolv.conf.wgm /etc/resolv.conf && "
+            f"wg-quick down wg0 || true && "
+            f"rm -f /etc/wireguard/wg0.conf && "
             f"apt update && "
             f"apt install -y wireguard resolvconf && "
             f"resolvconf -u &&"
@@ -810,7 +818,9 @@ class WireGuardManager:
             f"EOF\n"
             f"chmod 600 /etc/wireguard/{interface_name}.conf && "
             f"systemctl enable wg-quick@{interface_name} && "
-            f"wg-quick up {interface_name}"
+            f"wg-quick up {interface_name} && "
+            f"umount /etc/resolv.conf && "
+            f"rm -f /tmp/resolv.conf.wgm"
         )
 
         # Encode the script and wrap at 50 characters
@@ -957,6 +967,31 @@ class WireGuardManager:
 
         except Exception as e:
             logger.warning(f"Failed to check /etc/hosts conflicts: {e}")
+
+    def _update_resolv_conf(self) -> None:
+        """Update /etc/resolv.conf with current DNS domain."""
+        try:
+            dns_domain = self.config.dns_domain or 'vpn.local'
+
+            logger.info(f"Updating /etc/resolv.conf with DNS domain: {dns_domain}")
+
+            # Remove immutable flag if present
+            subprocess.run(['chattr', '-i', '/etc/resolv.conf'],
+                         stderr=subprocess.DEVNULL, check=False)
+
+            # Write new resolv.conf
+            resolv_conf_content = f"""nameserver 127.0.0.1
+search {dns_domain}
+nameserver 1.1.1.1
+"""
+            Path('/etc/resolv.conf').write_text(resolv_conf_content)
+
+            # Make it immutable
+            subprocess.run(['chattr', '+i', '/etc/resolv.conf'],
+                         stderr=subprocess.DEVNULL, check=False)
+
+        except Exception as e:
+            logger.warning(f"Failed to update /etc/resolv.conf: {e}")
 
     def _update_dns_config(self) -> None:
         """Update DNS configuration for client name resolution."""
@@ -1326,19 +1361,19 @@ def main():
     # Add client command
     add_parser = subparsers.add_parser("add", help="Add a new client")
     add_parser.add_argument("name", help="Client name")
-    add_parser.add_argument("--full-tunnel", action="store_true", help="Use full tunnel mode")
-    add_parser.add_argument("--split-tunnel", action="store_true", help="Use split tunnel mode")
+    add_parser.add_argument("--full-tunnel", "--full", action="store_true", help="Use full tunnel mode")
+    add_parser.add_argument("--split-tunnel", "--split", action="store_true", help="Use split tunnel mode")
     add_parser.add_argument("--restrict-to", nargs="+", metavar="IP",
                             help="List of IP addresses/networks this client can access (both IPv4 and IPv6)")
 
     # Show config command
     config_parser = subparsers.add_parser("config", help="Show client configuration details")
     config_parser.add_argument("name", help="Client name")
-    config_parser.add_argument("--show-qr", action="store_true", help="Show QR code in terminal")
+    config_parser.add_argument("--show-qr", "--qrcode", action="store_true", help="Show QR code in terminal")
     # Remove client command
     remove_parser = subparsers.add_parser("remove", help="Remove a client")
     remove_parser.add_argument("name", help="Client name")
-    remove_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    remove_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
 
     # List clients command
     subparsers.add_parser("list", help="List all clients")
