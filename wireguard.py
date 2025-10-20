@@ -804,23 +804,37 @@ class WireGuardManager:
 
     def _create_install_command(self, client_config: str, interface_name: str = 'wg0') -> str:
         """Create installation command using base64 encoding with line wrapping."""
-       
+
         install_script = (
-            f"mv -f /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true && "
-            f"ln -sf /run/resolvconf/resolv.conf /etc/resolv.conf && "
+            # Step 1: ensure temporary DNS works even if resolvconf/systemd-resolved missing
+            f"if ! grep -q 'nameserver' /etc/resolv.conf 2>/dev/null; then "
+            f"echo 'nameserver 1.1.1.1' > /etc/resolv.conf; "
+            f"fi && "
+
+            # Step 2: install dependencies (update once, then install, suppress noise)
+            f"apt update -y >/dev/null 2>&1 && "
+            f"for pkg in wireguard resolvconf; do dpkg -s $pkg >/dev/null 2>&1 || apt install -y $pkg >/dev/null 2>&1; done && "
+
+            # Step 3: ensure resolvconf directories exist and configure
+            f"mkdir -p /etc/resolvconf/resolv.conf.d && "
             f"echo 'nameserver 1.1.1.1' > /etc/resolvconf/resolv.conf.d/head && "
+
+            # Step 4: run resolvconf -u first to create /run/resolvconf/resolv.conf, then symlink
             f"resolvconf -u && "
-            f"wg-quick down {interface_name} || true && "
-            f"rm -f /etc/wireguard/{interface_name}.conf || true && "
-            f"for pkg in wireguard resolvconf; do dpkg -s $pkg >/dev/null 2>&1 || apt install -y $pkg; done && "
-            f"resolvconf -u && "
+            f"ln -sf /run/resolvconf/resolv.conf /etc/resolv.conf || true && "
+
+            # Step 5: prepare WireGuard config
+            f"wg-quick down {interface_name} 2>/dev/null || true && "
+            f"rm -f /etc/wireguard/{interface_name}.conf 2>/dev/null || true && "
             f"cat > /etc/wireguard/{interface_name}.conf << 'EOF'\n"
             f"{client_config}\n"
             f"EOF\n"
             f"chmod 600 /etc/wireguard/{interface_name}.conf && "
             f"systemctl enable wg-quick@{interface_name} && "
             f"wg-quick up {interface_name} && "
-            f"sed -i '/^nameserver 1\\.1\\.1\\.1$/d' /etc/resolvconf/resolv.conf.d/head || true && "
+
+            # Step 6: cleanup temporary DNS (remove both 1.1.1.1 and 8.8.8.8)
+            f"sed -i '/^nameserver 1\\.1\\.1\\.1$/d' /etc/resolvconf/resolv.conf.d/head 2>/dev/null || true && "
             f"resolvconf -u"
         )
 
