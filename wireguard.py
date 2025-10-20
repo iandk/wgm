@@ -404,15 +404,19 @@ class WireGuardManager:
                 '# Enable IP forwarding and NAT',
                 'PostUp = sysctl -w net.ipv4.ip_forward=1; '
                 'sysctl -w net.ipv6.conf.all.forwarding=1; '
-                f'iptables -A FORWARD -i %i -o %i -j ACCEPT; '
-                f'ip6tables -A FORWARD -i %i -o %i -j ACCEPT; '
+                f'iptables -A FORWARD -i %i -o {self.config.interface_name} -j ACCEPT; '
+                f'iptables -A FORWARD -i {self.config.interface_name} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; '
+                f'ip6tables -A FORWARD -i %i -o {self.config.interface_name} -j ACCEPT; '
+                f'ip6tables -A FORWARD -i {self.config.interface_name} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; '
                 f'iptables -t nat -A POSTROUTING -s {self.config.ipv4_subnet} -d {self.config.ipv4_subnet} -o %i -j MASQUERADE; '
                 f'ip6tables -t nat -A POSTROUTING -s {self.config.ipv6_subnet} -d {self.config.ipv6_subnet} -o %i -j MASQUERADE; '
                 f'iptables -t nat -A POSTROUTING -o {self.config.interface_name} -j MASQUERADE; '
                 f'ip6tables -t nat -A POSTROUTING -o {self.config.interface_name} -j MASQUERADE',
                 'PostDown = '
-                f'iptables -D FORWARD -i %i -o %i -j ACCEPT; '
-                f'ip6tables -D FORWARD -i %i -o %i -j ACCEPT; '
+                f'iptables -D FORWARD -i %i -o {self.config.interface_name} -j ACCEPT; '
+                f'iptables -D FORWARD -i {self.config.interface_name} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; '
+                f'ip6tables -D FORWARD -i %i -o {self.config.interface_name} -j ACCEPT; '
+                f'ip6tables -D FORWARD -i {self.config.interface_name} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; '
                 f'iptables -t nat -D POSTROUTING -s {self.config.ipv4_subnet} -d {self.config.ipv4_subnet} -o %i -j MASQUERADE; '
                 f'ip6tables -t nat -D POSTROUTING -s {self.config.ipv6_subnet} -d {self.config.ipv6_subnet} -o %i -j MASQUERADE; '
                 f'iptables -t nat -D POSTROUTING -o {self.config.interface_name} -j MASQUERADE; '
@@ -680,26 +684,10 @@ class WireGuardManager:
     def _update_dns_config(self) -> None:
         """Update DNS configuration for client name resolution."""
         try:
-            # First, handle any existing DNS services
-            try:
-                # Check if systemd-resolved is active
-                result = subprocess.run(['systemctl', 'is-active', 'systemd-resolved'],
-                                        capture_output=True, text=True)
-                if result.stdout.strip() == 'active':
-                    self._run_command(['systemctl', 'stop', 'systemd-resolved'])
-                    self._run_command(['systemctl', 'disable', 'systemd-resolved'])
-
-                # Kill any existing dnsmasq processes
-                self._run_command(['killall', 'dnsmasq'], timeout=5)
-            except subprocess.CalledProcessError:
-                # It's okay if these fail (services might not exist)
-                pass
-
             # Wait for WireGuard interface to be up
             retries = 5
             while retries > 0 and not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
                 time.sleep(1)
-                retries -= 1
 
             if not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
                 logger.warning(f"WireGuard interface {self.config.wg_interface} not found")
@@ -795,12 +783,8 @@ class WireGuardManager:
 
             # Restart dnsmasq with proper error handling
             try:
-                # First stop
-                self._run_command(['systemctl', 'stop', 'dnsmasq'])
-                time.sleep(2)  # Give it time to fully stop
-
-                # Then start
-                self._run_command(['systemctl', 'start', 'dnsmasq'])
+                self._run_command(['systemctl', 'restart', 'dnsmasq'])
+                time.sleep(1)  # Give it time to settle
 
                 # Verify it's running
                 status = self._run_command(['systemctl', 'is-active', 'dnsmasq'])

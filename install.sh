@@ -45,6 +45,16 @@ Before=
 WantedBy=multi-user.target
 EOF
 
+    if systemctl is-active --quiet systemd-resolved.service; then
+        log "Disabling systemd-resolved to prevent DNS port conflict..."
+        systemctl stop systemd-resolved
+        systemctl disable systemd-resolved
+        # Replace symlinked resolv.conf with a static one
+        rm -f /etc/resolv.conf
+        echo "nameserver 1.1.1.1" > /etc/resolv.conf
+        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+    fi
+
     log "Reloading systemd and restarting dnsmasq..."
     systemctl daemon-reload
     systemctl restart dnsmasq
