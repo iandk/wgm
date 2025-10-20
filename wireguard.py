@@ -1366,12 +1366,17 @@ nameserver 1.1.1.1
             client_status = self._get_client_status()
 
             table = Table(
-                title="WireGuard Clients",
                 show_header=True,
+                pad_edge=True,
+                # box=None,
+                # box=box.SIMPLE_HEAD,
                 box=box.SIMPLE,
                 expand=True,
-                header_style="bold",
+                padding=(0,0),
+                row_styles=["" ,"dim"],
+                header_style="grey100 bold",
                 show_lines=True,
+                highlight=False
             )
 
             table.add_column("Name", style="bold blue")
@@ -1453,7 +1458,7 @@ def main():
         description="WireGuard VPN Manager - Manage WireGuard server and clients with integrated DNS",
         epilog="""
 Examples:
-  wgm list                                      List all clients with status
+  wgm                                           List all clients (default command)
   wgm add laptop                                Add client (split tunnel - VPN subnet only)
   wgm add phone --full-tunnel                   Add client (full tunnel - all traffic via VPN)
   wgm add server --full --exclude-public-ips    Full tunnel, preserve direct access
@@ -1473,7 +1478,7 @@ For more info: https://github.com/iandk/wgm
 
     subparsers = parser.add_subparsers(
         dest="command",
-        required=True,
+        required=False,
         metavar="COMMAND",
         help="Available commands"
     )
@@ -1541,7 +1546,7 @@ For more info: https://github.com/iandk/wgm
     # List clients command
     subparsers.add_parser(
         "list",
-        help="List all clients",
+        help="List all clients (default)",
         description="Show all clients with status, addresses, tunnel mode, and restrictions"
     )
 
@@ -1571,6 +1576,10 @@ For more info: https://github.com/iandk/wgm
     )
 
     args = parser.parse_args()
+
+    # Default to 'list' command if no command specified
+    if not args.command:
+        args.command = "list"
 
     try:
         manager = WireGuardManager(args.config)

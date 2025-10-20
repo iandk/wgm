@@ -14,7 +14,7 @@ Config created at `/opt/wgm/config.yaml` during install. Customize before first 
 
 ```bash
 # List clients with status
-wgm list
+wgm
 
 # Add client (split tunnel - VPN subnet only)
 wgm add laptop
