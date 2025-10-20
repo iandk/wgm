@@ -24,10 +24,15 @@ from rich.prompt import Confirm
 import argparse
 from datetime import datetime
 
-# Configure logging
+
+# Configure logging, log to console and to file
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('wgm.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 console = Console()
@@ -92,6 +97,9 @@ class WireGuardManager:
 
         # Check if config changed and update if needed
         self._check_config_changes()
+
+        # Migrate legacy firewall rules to new per-client chain approach
+        self._migrate_legacy_firewall_rules()
 
     def _verify_system_dependencies(self) -> None:
         """Verify critical system dependencies are installed."""
@@ -547,8 +555,360 @@ class WireGuardManager:
             logger.error(f"Failed to flush old FORWARD rules: {e}")
             raise  # Re-raise, as this is critical for preventing rule duplication
 
+    def _get_client_chain_name(self, client: WireGuardClient, ipv6: bool = False) -> str:
+        """Get the iptables chain name for a client."""
+        prefix = "WG6_CLIENT" if ipv6 else "WG_CLIENT"
+        return f"{prefix}_{client.name}"
+
+    def _migrate_legacy_firewall_rules(self) -> None:
+        """Migrate from old-style firewall rules to new per-client chains.
+
+        This detects and removes old FORWARD rules that directly reference client IPs,
+        then rebuilds using the new chain-based approach.
+        """
+        try:
+            if not self.clients:
+                return
+
+            logger.info("Checking for legacy firewall rules...")
+
+            # Check if any legacy rules exist (non-chain rules for wg0)
+            has_legacy_rules = False
+            try:
+                iptables_dump = self._run_command(['iptables-save'])
+                for line in iptables_dump.split('\n'):
+                    # Look for old-style direct FORWARD rules (source from wg0, not jumping to our chains)
+                    if (line.startswith('-A FORWARD') and
+                        f'-i {self.config.wg_interface}' in line and
+                        '-s ' in line and
+                        '-j ACCEPT' in line and  # Old style ended with -j ACCEPT
+                        'WG_CLIENT' not in line and
+                        'WG6_CLIENT' not in line):
+                        has_legacy_rules = True
+                        break
+            except:
+                pass
+
+            if has_legacy_rules:
+                logger.info("Legacy firewall rules detected, migrating to per-client chains...")
+
+                # Flush old rules
+                self._flush_forward_rules()
+
+                # Rebuild with new chain approach
+                for client in self.clients.values():
+                    self._add_client_firewall_rules(client)
+
+                logger.info("Migration complete")
+
+        except Exception as e:
+            logger.warning(f"Failed to migrate legacy firewall rules: {e}")
+
+    def _ensure_base_firewall_rules(self) -> None:
+        """Ensure base NAT and forwarding rules exist (called once on setup)."""
+        try:
+            # These rules are normally set by wg-quick PostUp
+            # We need them when using syncconf without down/up cycle
+
+            # Check if base rules already exist
+            try:
+                result = self._run_command(['iptables', '-C', 'FORWARD',
+                                           '-i', self.config.interface_name,
+                                           '-o', self.config.wg_interface,
+                                           '-m', 'state', '--state', 'RELATED,ESTABLISHED',
+                                           '-j', 'ACCEPT'])
+                # Rule exists, skip setup
+                return
+            except:
+                # Rule doesn't exist, continue with setup
+                pass
+
+            logger.info("Setting up base firewall rules")
+
+            # IPv4 rules
+            self._run_command([
+                'iptables', '-A', 'FORWARD',
+                '-i', self.config.interface_name,
+                '-o', self.config.wg_interface,
+                '-m', 'state', '--state', 'RELATED,ESTABLISHED',
+                '-j', 'ACCEPT'
+            ])
+
+            # IPv6 rules
+            self._run_command([
+                'ip6tables', '-A', 'FORWARD',
+                '-i', self.config.interface_name,
+                '-o', self.config.wg_interface,
+                '-m', 'state', '--state', 'RELATED,ESTABLISHED',
+                '-j', 'ACCEPT'
+            ])
+
+            # NAT rules
+            self._run_command([
+                'iptables', '-t', 'nat', '-A', 'POSTROUTING',
+                '-s', self.config.ipv4_subnet,
+                '-d', self.config.ipv4_subnet,
+                '-o', self.config.wg_interface,
+                '-j', 'MASQUERADE'
+            ])
+
+            self._run_command([
+                'ip6tables', '-t', 'nat', '-A', 'POSTROUTING',
+                '-s', self.config.ipv6_subnet,
+                '-d', self.config.ipv6_subnet,
+                '-o', self.config.wg_interface,
+                '-j', 'MASQUERADE'
+            ])
+
+            self._run_command([
+                'iptables', '-t', 'nat', '-A', 'POSTROUTING',
+                '-o', self.config.interface_name,
+                '-j', 'MASQUERADE'
+            ])
+
+            self._run_command([
+                'ip6tables', '-t', 'nat', '-A', 'POSTROUTING',
+                '-o', self.config.interface_name,
+                '-j', 'MASQUERADE'
+            ])
+
+        except Exception as e:
+            logger.warning(f"Failed to ensure base firewall rules: {e}")
+
+    def _add_client_firewall_rules(self, client: WireGuardClient) -> None:
+        """Add firewall rules for a specific client using custom chains.
+
+        Creates per-client chains for clean rule management and zero-downtime updates.
+        """
+        try:
+            client_ip = client.ipv4.split('/')[0]
+            client_ip6 = client.ipv6.split('/')[0]
+
+            # Get server gateway IPs
+            server_ips = self._get_server_ips()
+            server_ipv4 = server_ips.split(',')[0].split('/')[0].strip()
+            server_ipv6 = server_ips.split(',')[1].split('/')[0].strip()
+
+            chain_name = self._get_client_chain_name(client, ipv6=False)
+            chain_name6 = self._get_client_chain_name(client, ipv6=True)
+
+            # Create IPv4 chain (skip if exists)
+            try:
+                self._run_command(['iptables', '-N', chain_name])
+            except:
+                # Chain already exists, flush it first
+                self._run_command(['iptables', '-F', chain_name])
+
+            # Create IPv6 chain (skip if exists)
+            try:
+                self._run_command(['ip6tables', '-N', chain_name6])
+            except:
+                # Chain already exists, flush it first
+                self._run_command(['ip6tables', '-F', chain_name6])
+
+            # Jump to client chain from FORWARD (check if rule exists first)
+            # Check and add IPv4 forward rule
+            result = subprocess.run(
+                ['iptables', '-C', 'FORWARD', '-i', self.config.wg_interface, '-s', client_ip, '-j', chain_name],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                self._run_command([
+                    'iptables', '-A', 'FORWARD',
+                    '-i', self.config.wg_interface,
+                    '-s', client_ip,
+                    '-j', chain_name
+                ])
+
+            # Check and add IPv6 forward rule
+            result = subprocess.run(
+                ['ip6tables', '-C', 'FORWARD', '-i', self.config.wg_interface, '-s', client_ip6, '-j', chain_name6],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                self._run_command([
+                    'ip6tables', '-A', 'FORWARD',
+                    '-i', self.config.wg_interface,
+                    '-s', client_ip6,
+                    '-j', chain_name6
+                ])
+
+            # Add return traffic rules (always allowed)
+            # Check and add IPv4 return rule
+            result = subprocess.run(
+                ['iptables', '-C', 'FORWARD', '-o', self.config.wg_interface, '-d', client_ip, '-j', 'ACCEPT'],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                self._run_command([
+                    'iptables', '-A', 'FORWARD',
+                    '-o', self.config.wg_interface,
+                    '-d', client_ip,
+                    '-j', 'ACCEPT'
+                ])
+
+            # Check and add IPv6 return rule
+            result = subprocess.run(
+                ['ip6tables', '-C', 'FORWARD', '-o', self.config.wg_interface, '-d', client_ip6, '-j', 'ACCEPT'],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                self._run_command([
+                    'ip6tables', '-A', 'FORWARD',
+                    '-o', self.config.wg_interface,
+                    '-d', client_ip6,
+                    '-j', 'ACCEPT'
+                ])
+
+            # Populate chain based on restrictions
+            if client.restricted_ips or client.restricted_ip6s:
+                # Restricted client - allow gateway + specific IPs only
+
+                # IPv4 rules
+                # Always allow VPN gateway for DNS
+                self._run_command([
+                    'iptables', '-A', chain_name,
+                    '-d', server_ipv4,
+                    '-j', 'ACCEPT'
+                ])
+
+                # Allow specific destinations
+                for dest_ip in client.restricted_ips:
+                    self._run_command([
+                        'iptables', '-A', chain_name,
+                        '-d', dest_ip,
+                        '-j', 'ACCEPT'
+                    ])
+
+                # Drop everything else
+                self._run_command([
+                    'iptables', '-A', chain_name,
+                    '-j', 'DROP'
+                ])
+
+                # IPv6 rules
+                # Always allow VPN gateway for DNS
+                self._run_command([
+                    'ip6tables', '-A', chain_name6,
+                    '-d', server_ipv6,
+                    '-j', 'ACCEPT'
+                ])
+
+                # Allow specific destinations
+                for dest_ip in client.restricted_ip6s:
+                    self._run_command([
+                        'ip6tables', '-A', chain_name6,
+                        '-d', dest_ip,
+                        '-j', 'ACCEPT'
+                    ])
+
+                # Drop everything else
+                self._run_command([
+                    'ip6tables', '-A', chain_name6,
+                    '-j', 'DROP'
+                ])
+            else:
+                # Unrestricted client - allow all
+                self._run_command([
+                    'iptables', '-A', chain_name,
+                    '-j', 'ACCEPT'
+                ])
+
+                self._run_command([
+                    'ip6tables', '-A', chain_name6,
+                    '-j', 'ACCEPT'
+                ])
+
+            logger.debug(f"Added firewall rules for client {client.name}")
+
+        except Exception as e:
+            logger.error(f"Failed to add firewall rules for client {client.name}: {e}")
+            raise
+
+    def _remove_client_firewall_rules(self, client: WireGuardClient) -> None:
+        """Remove all firewall rules for a specific client."""
+        try:
+            client_ip = client.ipv4.split('/')[0]
+            client_ip6 = client.ipv6.split('/')[0]
+
+            chain_name = self._get_client_chain_name(client, ipv6=False)
+            chain_name6 = self._get_client_chain_name(client, ipv6=True)
+
+            # Remove jump rules from FORWARD
+            try:
+                self._run_command([
+                    'iptables', '-D', 'FORWARD',
+                    '-i', self.config.wg_interface,
+                    '-s', client_ip,
+                    '-j', chain_name
+                ])
+            except:
+                pass
+
+            try:
+                self._run_command([
+                    'ip6tables', '-D', 'FORWARD',
+                    '-i', self.config.wg_interface,
+                    '-s', client_ip6,
+                    '-j', chain_name6
+                ])
+            except:
+                pass
+
+            # Remove return traffic rules
+            try:
+                self._run_command([
+                    'iptables', '-D', 'FORWARD',
+                    '-o', self.config.wg_interface,
+                    '-d', client_ip,
+                    '-j', 'ACCEPT'
+                ])
+            except:
+                pass
+
+            try:
+                self._run_command([
+                    'ip6tables', '-D', 'FORWARD',
+                    '-o', self.config.wg_interface,
+                    '-d', client_ip6,
+                    '-j', 'ACCEPT'
+                ])
+            except:
+                pass
+
+            # Flush and delete chains
+            try:
+                self._run_command(['iptables', '-F', chain_name])
+                self._run_command(['iptables', '-X', chain_name])
+            except:
+                pass
+
+            try:
+                self._run_command(['ip6tables', '-F', chain_name6])
+                self._run_command(['ip6tables', '-X', chain_name6])
+            except:
+                pass
+
+            logger.debug(f"Removed firewall rules for client {client.name}")
+
+        except Exception as e:
+            logger.warning(f"Failed to remove firewall rules for client {client.name}: {e}")
+
     def _update_client_firewall_rules(self, client: WireGuardClient) -> None:
-        """Update firewall rules for a specific client with restrictions.
+        """Update firewall rules for a specific client (for restriction changes).
+
+        Removes and re-adds the client's rules to apply changes.
+        """
+        try:
+            logger.debug(f"Updating firewall rules for client {client.name}")
+            self._remove_client_firewall_rules(client)
+            self._add_client_firewall_rules(client)
+        except Exception as e:
+            logger.error(f"Failed to update firewall rules for client {client.name}: {e}")
+            raise
+
+    def _update_client_firewall_rules_legacy(self, client: WireGuardClient) -> None:
+        """Legacy method - Update firewall rules for a specific client with restrictions.
 
         Rules are only added here - cleanup happens via _flush_forward_rules()
         before _update_server_config() regenerates all rules.
@@ -631,15 +991,10 @@ class WireGuardManager:
             raise
 
     def _update_server_config(self) -> None:
-        """Update WireGuard server configuration."""
+        """Update WireGuard server configuration using hot reload when possible."""
         try:
-            # First try to clean up existing interface
-            if Path(f"/sys/class/net/{self.config.wg_interface}").exists():
-                try:
-                    # Stop interface if running
-                    self._run_command(['wg-quick', 'down', self.config.wg_interface])
-                except Exception as e:
-                    logger.warning(f"Failed to bring down interface: {e}")
+            config_path = Path(self.config.config_dir) / f"{self.config.wg_interface}.conf"
+            interface_exists = Path(f"/sys/class/net/{self.config.wg_interface}").exists()
 
             # Build server config
             config_lines = [
@@ -680,67 +1035,57 @@ class WireGuardManager:
             config_lines.append('')
 
             # Write config file
-            config_path = Path(self.config.config_dir) / f"{self.config.wg_interface}.conf"
             config_path.write_text('\n'.join(config_lines))
             config_path.chmod(0o600)
 
-            # Flush all old FORWARD rules before adding new ones
-            self._flush_forward_rules()
+            if interface_exists:
+                # Hot reload - use syncconf for zero downtime
+                # syncconf needs config with PrivateKey but no PostUp/PostDown/comment lines
+                logger.debug("Hot-reloading WireGuard config with syncconf")
 
-            # Start interface
-            self._run_command(['wg-quick', 'up', self.config.wg_interface])
+                # Create stripped config - syncconf only wants PrivateKey in Interface, and Peer sections
+                stripped_lines = []
+                for line in config_lines:
+                    stripped = line.strip()
+                    # Skip PostUp, PostDown, Address, ListenPort, and comments
+                    # syncconf only accepts PrivateKey, PublicKey in Interface section
+                    if (stripped.startswith('PostUp =') or
+                        stripped.startswith('PostDown =') or
+                        stripped.startswith('Address =') or
+                        stripped.startswith('ListenPort =') or
+                        (stripped.startswith('#') and not stripped.startswith('['))):
+                        continue
+                    stripped_lines.append(line)
 
-            # IMPORTANT: Add restricted client rules FIRST (before unrestricted)
-            # This ensures DROP rules are evaluated before broad ACCEPT rules
-            restricted_clients = [client for client in self.clients.values()
-                                  if client.restricted_ips or client.restricted_ip6s]
-            for client in restricted_clients:
-                self._update_client_firewall_rules(client)
+                # Write stripped config to temporary file
+                stripped_config = '\n'.join(stripped_lines)
+                temp_config_path = config_path.parent / f"{self.config.wg_interface}_syncconf.conf"
+                temp_config_path.write_text(stripped_config)
+                temp_config_path.chmod(0o600)
 
-            # Add default forward rules (only for unrestricted clients)
-            # These come AFTER restricted rules to avoid bypassing restrictions
-            unrestricted_clients = [client for client in self.clients.values()
-                                    if not client.restricted_ips and not client.restricted_ip6s]
+                try:
+                    self._run_command(['wg', 'syncconf', self.config.wg_interface, str(temp_config_path)])
+                    # Ensure listen port is correct after syncconf (it can get reset)
+                    self._run_command(['wg', 'set', self.config.wg_interface, 'listen-port', str(self.config.server_port)])
+                except Exception as e:
+                    logger.error(f"syncconf failed. Temp config at: {temp_config_path}")
+                    logger.error(f"Config content:\n{stripped_config}")
+                    raise
+                finally:
+                    # Clean up temp file only if syncconf succeeded
+                    if temp_config_path.exists():
+                        temp_config_path.unlink()
+            else:
+                # Initial setup - use wg-quick to set up interface and base rules
+                logger.info("Performing initial WireGuard interface setup")
+                self._run_command(['wg-quick', 'up', self.config.wg_interface])
 
-            for client in unrestricted_clients:
-                client_ip = client.ipv4.split('/')[0]
-                client_ip6 = client.ipv6.split('/')[0]
-
-                # Add IPv4 rules
-                self._run_command([
-                    'iptables', '-A', 'FORWARD',
-                    '-i', self.config.wg_interface,
-                    '-s', client_ip,
-                    '-j', 'ACCEPT'
-                ])
-                self._run_command([
-                    'iptables', '-A', 'FORWARD',
-                    '-o', self.config.wg_interface,
-                    '-d', client_ip,
-                    '-j', 'ACCEPT'
-                ])
-
-                # Add IPv6 rules
-                self._run_command([
-                    'ip6tables', '-A', 'FORWARD',
-                    '-i', self.config.wg_interface,
-                    '-s', client_ip6,
-                    '-j', 'ACCEPT'
-                ])
-                self._run_command([
-                    'ip6tables', '-A', 'FORWARD',
-                    '-o', self.config.wg_interface,
-                    '-d', client_ip6,
-                    '-j', 'ACCEPT'
-                ])
-
+                # Update DNS configuration on initial setup
+                self._update_dns_config()
 
             # Verify interface is up
             if not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
                 raise RuntimeError("Failed to create WireGuard interface")
-
-            # Update DNS configuration AFTER interface is up and verified
-            self._update_dns_config()
 
         except Exception as e:
             logger.error(f"Failed to update server config: {e}")
@@ -801,10 +1146,11 @@ class WireGuardManager:
                 if remove_ip6s:
                     client.restricted_ip6s = [ip for ip in client.restricted_ip6s if ip not in remove_ip6s]
 
-            # Save changes and regenerate entire server config
-            # This ensures all firewall rules are correctly ordered
+            # Save changes
             self._save_clients()
-            self._update_server_config()
+
+            # Update firewall rules for this client only (removes and re-adds chain)
+            self._update_client_firewall_rules(client)
 
             console.print(f"[green]Successfully updated restrictions for client {name}[/green]")
             if client.restricted_ips or client.restricted_ip6s:
@@ -960,8 +1306,15 @@ class WireGuardManager:
             # Update system configurations
             self.clients[name] = client
             self._save_clients()
-            self._update_client_firewall_rules(client)
+
+            # Add firewall rules for new client only
+            self._add_client_firewall_rules(client)
+
+            # Hot-reload WireGuard config (zero downtime for existing clients)
             self._update_server_config()
+
+            # Update DNS configuration
+            self._update_dns_config()
 
             # Print success and show configuration
             console.print(f"\n[bold green]Successfully created client {name}[/bold green]")
@@ -1351,10 +1704,21 @@ nameserver 1.1.1.1
             if qr_path.exists():
                 qr_path.unlink()
 
+            # Get client object before removing
+            client = self.clients[name]
+
+            # Remove firewall rules for this client only
+            self._remove_client_firewall_rules(client)
+
             # Remove client and update
             del self.clients[name]
             self._save_clients()
+
+            # Hot-reload WireGuard config (zero downtime for other clients)
             self._update_server_config()
+
+            # Update DNS configuration
+            self._update_dns_config()
 
             console.print(f"[green]Successfully removed client {name}[/green]")
 

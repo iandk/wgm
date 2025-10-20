@@ -5,3 +5,4 @@
 config.yaml
 qr_codes/
 .config_hash
+wireguard.py
