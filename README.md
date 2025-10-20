@@ -53,18 +53,97 @@ This dynamically excludes the client's public IPv4 and IPv6 addresses from VPN r
 
 ## IP Restrictions
 
-Restrict clients to specific destination IPs:
+Restrict clients to access only specific destinations using firewall rules. Perfect for limiting access to specific services or hosts.
+
+### Basic Usage
 
 ```bash
-# Create client restricted to specific IP(s) only
-wgm add client1 --restrict-to 192.168.1.100
-# or 
-wgm add client2 --restrict-to 192.168.1.200 10.0.5.0/24
+# Restrict to single IP
+wgm add client1 --restrict-to 10.99.99.3
 
-# Modify restrictions after creation
-wgm restrict client1 --allow 192.168.1.200
-wgm restrict client1 --deny 192.168.1.100
+# Restrict to multiple IPs/networks
+wgm add client2 --restrict-to 10.99.99.3 192.168.1.0/24
+
+# Mix IPv4 and IPv6 restrictions
+wgm add client3 --restrict-to 10.99.99.3 fd99:99::5
+```
+
+### Behavior
+
+**Gateway Auto-Allowed:**
+- VPN gateway (e.g., `10.99.99.1` and `fd99:99::1`) is automatically accessible for DNS
+- Not stored in restriction list, dynamically added to firewall rules
+- Works with custom subnets configured in `config.yaml`
+
+**IPv4-only restrictions:**
+```bash
+wgm add client1 --restrict-to 10.99.99.3
+```
+- ✅ Allows: `10.99.99.3` (specified), `10.99.99.1` (gateway)
+- ❌ Blocks: All other IPv4 traffic
+- ❌ Blocks: **All IPv6 traffic** (except gateway `fd99:99::1`)
+
+**IPv6-only restrictions:**
+```bash
+wgm add client2 --restrict-to fd99:99::5
+```
+- ✅ Allows: `fd99:99::5` (specified), `fd99:99::1` (gateway)
+- ❌ Blocks: All other IPv6 traffic
+- ❌ Blocks: **All IPv4 traffic** (except gateway `10.99.99.1`)
+
+**Mixed IPv4/IPv6 restrictions:**
+```bash
+wgm add client3 --restrict-to 10.99.99.3 fd99:99::5
+```
+- ✅ IPv4: `10.99.99.3` + gateway
+- ✅ IPv6: `fd99:99::5` + gateway
+- ❌ All other traffic blocked
+
+### Modifying Restrictions
+
+```bash
+# Add more allowed destinations
+wgm restrict client1 --allow 10.99.99.5 192.168.1.100
+
+# Remove allowed destinations
+wgm restrict client1 --deny 10.99.99.3
+
+# Clear all restrictions (client becomes unrestricted)
 wgm restrict client1 --clear
+```
+
+**Note:** Modifications trigger a full server config rebuild to ensure correct firewall rule ordering.
+
+### Network Notation
+
+```bash
+# Single IP (implicit /32 for IPv4, /128 for IPv6)
+--restrict-to 10.99.99.3              # Same as 10.99.99.3/32
+--restrict-to fd99:99::5              # Same as fd99:99::5/128
+
+# Network ranges
+--restrict-to 192.168.1.0/24          # Entire subnet
+--restrict-to fd99:99::/64            # IPv6 subnet
+```
+
+### Use Cases
+
+**Database Server Access:**
+```bash
+# Only allow access to database server
+wgm add db-client --restrict-to 10.99.99.10
+```
+
+**Multi-Service Access:**
+```bash
+# Access to web and database servers
+wgm add app-client --restrict-to 10.99.99.10 10.99.99.20
+```
+
+**Subnet Access:**
+```bash
+# Access entire internal network
+wgm add admin-client --restrict-to 192.168.0.0/16
 ```
 
 ## DNS Features

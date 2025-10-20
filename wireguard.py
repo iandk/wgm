@@ -548,33 +548,37 @@ class WireGuardManager:
             raise  # Re-raise, as this is critical for preventing rule duplication
 
     def _update_client_firewall_rules(self, client: WireGuardClient) -> None:
-        """Update firewall rules for a specific client."""
+        """Update firewall rules for a specific client with restrictions.
+
+        Rules are only added here - cleanup happens via _flush_forward_rules()
+        before _update_server_config() regenerates all rules.
+
+        For restricted clients:
+        - Auto-allows VPN gateway (for DNS) without storing in client data
+        - Blocks all other traffic in both IPv4 and IPv6
+        """
         try:
             client_ip = client.ipv4.split('/')[0]
             client_ip6 = client.ipv6.split('/')[0]
 
-            # Clean up existing IPv4 rules
-            try:
-                iptables_list = self._run_command(['iptables', '-L', 'FORWARD', '--line-numbers'])
-                for line in reversed(iptables_list.split('\n')):
-                    if client_ip in line:
-                        rule_num = line.split()[0]
-                        self._run_command(['iptables', '-D', 'FORWARD', rule_num])
-            except Exception as e:
-                logger.warning(f"Error cleaning up old IPv4 rules: {e}")
-
-            # Clean up existing IPv6 rules
-            try:
-                ip6tables_list = self._run_command(['ip6tables', '-L', 'FORWARD', '--line-numbers'])
-                for line in reversed(ip6tables_list.split('\n')):
-                    if client_ip6 in line:
-                        rule_num = line.split()[0]
-                        self._run_command(['ip6tables', '-D', 'FORWARD', rule_num])
-            except Exception as e:
-                logger.warning(f"Error cleaning up old IPv6 rules: {e}")
+            # Get server gateway IPs dynamically from config
+            server_ips = self._get_server_ips()
+            server_ipv4 = server_ips.split(',')[0].split('/')[0].strip()
+            server_ipv6 = server_ips.split(',')[1].split('/')[0].strip()
 
             # Add IPv4 restrictions
-            if client.restricted_ips:
+            # If ANY restrictions exist, apply to both IPv4 and IPv6
+            if client.restricted_ips or client.restricted_ip6s:
+                # Always allow access to VPN gateway for DNS (auto-added, not stored)
+                self._run_command([
+                    'iptables', '-A', 'FORWARD',
+                    '-i', self.config.wg_interface,
+                    '-s', client_ip,
+                    '-d', server_ipv4,
+                    '-j', 'ACCEPT'
+                ])
+
+                # Allow specific IPv4 destinations from user restrictions
                 for dest_ip in client.restricted_ips:
                     self._run_command([
                         'iptables', '-A', 'FORWARD',
@@ -584,6 +588,7 @@ class WireGuardManager:
                         '-j', 'ACCEPT'
                     ])
 
+                # Drop all other IPv4 traffic
                 self._run_command([
                     'iptables', '-A', 'FORWARD',
                     '-i', self.config.wg_interface,
@@ -592,7 +597,18 @@ class WireGuardManager:
                 ])
 
             # Add IPv6 restrictions
-            if client.restricted_ip6s:
+            # If ANY restrictions exist, apply to both IPv4 and IPv6
+            if client.restricted_ips or client.restricted_ip6s:
+                # Always allow access to VPN gateway for DNS (auto-added, not stored)
+                self._run_command([
+                    'ip6tables', '-A', 'FORWARD',
+                    '-i', self.config.wg_interface,
+                    '-s', client_ip6,
+                    '-d', server_ipv6,
+                    '-j', 'ACCEPT'
+                ])
+
+                # Allow specific IPv6 destinations from user restrictions
                 for dest_ip in client.restricted_ip6s:
                     self._run_command([
                         'ip6tables', '-A', 'FORWARD',
@@ -602,6 +618,7 @@ class WireGuardManager:
                         '-j', 'ACCEPT'
                     ])
 
+                # Drop all other IPv6 traffic
                 self._run_command([
                     'ip6tables', '-A', 'FORWARD',
                     '-i', self.config.wg_interface,
@@ -630,21 +647,17 @@ class WireGuardManager:
                 f'PrivateKey = {self.config.server_private_key}',
                 f'Address = {self._get_server_ips()}',
                 f'ListenPort = {self.config.server_port}',
-                '# Enable IP forwarding and NAT',
+                '# Enable IP forwarding, return traffic, and NAT',
                 'PostUp = sysctl -w net.ipv4.ip_forward=1; '
                 'sysctl -w net.ipv6.conf.all.forwarding=1; '
-                f'iptables -A FORWARD -i %i -o {self.config.interface_name} -j ACCEPT; '
                 f'iptables -A FORWARD -i {self.config.interface_name} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; '
-                f'ip6tables -A FORWARD -i %i -o {self.config.interface_name} -j ACCEPT; '
                 f'ip6tables -A FORWARD -i {self.config.interface_name} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; '
                 f'iptables -t nat -A POSTROUTING -s {self.config.ipv4_subnet} -d {self.config.ipv4_subnet} -o %i -j MASQUERADE; '
                 f'ip6tables -t nat -A POSTROUTING -s {self.config.ipv6_subnet} -d {self.config.ipv6_subnet} -o %i -j MASQUERADE; '
                 f'iptables -t nat -A POSTROUTING -o {self.config.interface_name} -j MASQUERADE; '
                 f'ip6tables -t nat -A POSTROUTING -o {self.config.interface_name} -j MASQUERADE',
                 'PostDown = '
-                f'iptables -D FORWARD -i %i -o {self.config.interface_name} -j ACCEPT; '
                 f'iptables -D FORWARD -i {self.config.interface_name} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; '
-                f'ip6tables -D FORWARD -i %i -o {self.config.interface_name} -j ACCEPT; '
                 f'ip6tables -D FORWARD -i {self.config.interface_name} -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; '
                 f'iptables -t nat -D POSTROUTING -s {self.config.ipv4_subnet} -d {self.config.ipv4_subnet} -o %i -j MASQUERADE; '
                 f'ip6tables -t nat -D POSTROUTING -s {self.config.ipv6_subnet} -d {self.config.ipv6_subnet} -o %i -j MASQUERADE; '
@@ -677,7 +690,15 @@ class WireGuardManager:
             # Start interface
             self._run_command(['wg-quick', 'up', self.config.wg_interface])
 
+            # IMPORTANT: Add restricted client rules FIRST (before unrestricted)
+            # This ensures DROP rules are evaluated before broad ACCEPT rules
+            restricted_clients = [client for client in self.clients.values()
+                                  if client.restricted_ips or client.restricted_ip6s]
+            for client in restricted_clients:
+                self._update_client_firewall_rules(client)
+
             # Add default forward rules (only for unrestricted clients)
+            # These come AFTER restricted rules to avoid bypassing restrictions
             unrestricted_clients = [client for client in self.clients.values()
                                     if not client.restricted_ips and not client.restricted_ip6s]
 
@@ -713,11 +734,6 @@ class WireGuardManager:
                     '-j', 'ACCEPT'
                 ])
 
-            # Update firewall rules for all restricted clients
-            restricted_clients = [client for client in self.clients.values()
-                                  if client.restricted_ips or client.restricted_ip6s]
-            for client in restricted_clients:
-                self._update_client_firewall_rules(client)
 
             # Verify interface is up
             if not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
@@ -785,9 +801,10 @@ class WireGuardManager:
                 if remove_ip6s:
                     client.restricted_ip6s = [ip for ip in client.restricted_ip6s if ip not in remove_ip6s]
 
-            # Update firewall rules and save changes
-            self._update_client_firewall_rules(client)
+            # Save changes and regenerate entire server config
+            # This ensures all firewall rules are correctly ordered
             self._save_clients()
+            self._update_server_config()
 
             console.print(f"[green]Successfully updated restrictions for client {name}[/green]")
             if client.restricted_ips or client.restricted_ip6s:
@@ -812,6 +829,7 @@ class WireGuardManager:
             f"fi && "
 
             # Step 2: install dependencies (update once, then install, suppress noise)
+            f"echo 'Installing dependencies...'"
             f"apt update -y >/dev/null 2>&1 && "
             f"for pkg in wireguard resolvconf; do dpkg -s $pkg >/dev/null 2>&1 || apt install -y $pkg >/dev/null 2>&1; done && "
 
