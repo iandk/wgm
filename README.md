@@ -56,8 +56,10 @@ This dynamically excludes the client's public IPv4 and IPv6 addresses from VPN r
 Restrict clients to specific destination IPs:
 
 ```bash
-# Create client restricted to specific IPs only
-wgm add client1 --restrict-to 192.168.1.100 10.0.5.0/24
+# Create client restricted to specific IP(s) only
+wgm add client1 --restrict-to 192.168.1.100
+# or 
+wgm add client2 --restrict-to 192.168.1.200 10.0.5.0/24
 
 # Modify restrictions after creation
 wgm restrict client1 --allow 192.168.1.200

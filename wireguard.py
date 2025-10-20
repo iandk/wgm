@@ -1330,12 +1330,12 @@ nameserver 1.1.1.1
             logger.error(f"Failed to remove client: {e}")
             raise
 
-    def _get_client_status(self) -> Dict[str, Dict[str, str]]:
+    def _get_all_client_status(self) -> dict:
         """Get status information for all clients from wg command."""
         try:
             wg_output = self._run_command(['wg', 'show', self.config.wg_interface])
             current_peer = None
-            peer_info = {}
+            peer_info = dict()
 
             for line in wg_output.split('\n'):
                 line = line.strip()
@@ -1354,6 +1354,51 @@ nameserver 1.1.1.1
         except Exception as e:
             logger.warning(f"Failed to get client status: {e}")
             return {}
+    
+    def _get_client_restrictions(self, client) -> Optional[str]:
+        """Get the restrictions for a client."""
+        restrictions = []
+        if client.restricted_ips:
+            restrictions.extend(client.restricted_ips)
+        if client.restricted_ip6s:
+            restrictions.extend(client.restricted_ip6s)
+        
+        if not restrictions:
+            return None
+        
+        return f"Restricted to: {", ".join(restrictions)}"
+
+        
+    def _get_client_tunnel_mode(self, client) -> str:
+        """Get the tunnel mode for a client."""
+        mode="Unknown"
+        if "0.0.0.0/0" in client.allowed_ips and client.exclude_public_ips:
+            mode = "[green bold]Full[/] [green dim](public IPs excluded)[/]"
+        if "0.0.0.0/0" in client.allowed_ips and not client.exclude_public_ips:
+            mode = "[green bold]Full[/]"
+        if not "0.0.0.0/0" in client.allowed_ips:
+            mode = "[cyan bold]Split[/]"
+        
+        restrictions = self._get_client_restrictions(client) or "[dim]No restrictions[/]"
+        return f"{mode} \n{restrictions}"
+    
+    def _get_client_status(self, client) -> dict:
+        """Get the status for a client."""
+        # return dict with status and last seen
+        status = {
+            "status": "Unknown",
+            "status_formatted": "[red]Unknown[/red]",
+            "last_seen": "Never",
+            "last_seen_formatted": "[red]Never[/red]"
+        }
+        client_status = self._get_all_client_status()
+        
+        if client.public_key in client_status:
+            status["status"] = client_status[client.public_key]['status']
+            status["status_formatted"] = f"[green]{status['status']}[/green]" if status["status"] == "Online" else f"[red]{status['status']}[/red]"
+            status["last_seen"] = client_status[client.public_key]['last_seen']
+            status["last_seen_formatted"] = f"[dim]{status['last_seen']}[/dim]" if status["last_seen"] != "Never" else f"[dim]{status['last_seen']}[/dim]"
+        return status
 
     def list_clients(self) -> None:
         """List all WireGuard clients."""
@@ -1363,7 +1408,7 @@ nameserver 1.1.1.1
                 return
 
             # Get current status for all clients
-            client_status = self._get_client_status()
+            client_status = self._get_all_client_status()
 
             table = Table(
                 show_header=True,
@@ -1373,7 +1418,7 @@ nameserver 1.1.1.1
                 box=box.SIMPLE,
                 expand=True,
                 padding=(0,0),
-                row_styles=["" ,"dim"],
+                row_styles=["" ,""],
                 header_style="grey100 bold",
                 show_lines=True,
                 highlight=False
@@ -1382,8 +1427,9 @@ nameserver 1.1.1.1
             table.add_column("Name", style="bold blue")
             table.add_column("Status", style="")
             table.add_column("Addresses", style="")
-            table.add_column("Tunnel Mode", style="", min_width=30)
-            table.add_column("Restrictions", style="", max_width=40)
+            # table.add_column("Tunnel Mode", style="", min_width=30)
+            # table.add_column("Restrictions", style="", max_width=40)
+            table.add_column("Mode", style="")
             table.add_column("Last Seen", style="")
             table.add_column("Created", style="dim")
 
@@ -1391,42 +1437,15 @@ nameserver 1.1.1.1
             pubkey_to_name = {client.public_key: name for name, client in self.clients.items()}
 
             for name, client in sorted(self.clients.items()):
-                # Determine tunnel mode with exclude_public_ips indicator
-                if "0.0.0.0/0" in client.allowed_ips:
-                    if client.exclude_public_ips:
-                        tunnel_mode = "[blue]Full[/blue] [dim](public IPs excluded)[/dim]"
-                    else:
-                        tunnel_mode = "[blue]Full[/blue]"
-                else:
-                    tunnel_mode = "[yellow]Split[/yellow]"
-
+                name = f"[bold blue]{name}[/]"
                 # in german format
                 created = datetime.fromisoformat(client.created_at).strftime("%d.%m.%Y %H:%M") if client.created_at else "Unknown"
 
                 # Get status info for this client
-                status = "Unknown"
-                last_seen = "Never"
-                for pubkey, info in client_status.items():
-                    if pubkey == client.public_key:
-                        status = info['status']
-                        last_seen = info['last_seen']
-                        break
-
-                # Format restrictions
-                restrictions = []
-                if client.restricted_ips:
-                    restrictions.extend(client.restricted_ips)
-                if client.restricted_ip6s:
-                    restrictions.extend(client.restricted_ip6s)
-                restriction_text = ", ".join(restrictions) if restrictions else "[dim]None[/dim]"
-
-                # Set status style
-                status_display = f"● {status}"
-                if status == "Online":
-                    status_display = f"[green]{status_display}[/green]"
-                else:
-                    status_display = f"[red]{status_display}[/red]"
-
+                status = self._get_client_status(client)
+                status_formatted = f"{status['status_formatted']}"
+                last_seen_formatted = f"{status['last_seen_formatted']}"
+                
                 # Addresses
                 addresses = []
                 if client.ipv4:
@@ -1435,14 +1454,16 @@ nameserver 1.1.1.1
                     addresses.append(client.ipv6)
 
                 addresses_text = "\n".join(addresses) if addresses else "Unknown"
-
+                
+                # Mode and restrictions
+                mode_and_restrictions = self._get_client_tunnel_mode(client)
+                
                 table.add_row(
                     name,
-                    status_display,
+                    status_formatted,
                     addresses_text,
-                    tunnel_mode,
-                    restriction_text,
-                    last_seen,
+                    mode_and_restrictions,
+                    last_seen_formatted,
                     created
                 )
 
