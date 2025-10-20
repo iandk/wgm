@@ -1,0 +1,51 @@
+# WireGuard Manager Configuration
+# Copy this file to config.yaml and adjust as needed
+
+# IPv4 subnet for VPN clients
+ipv4_subnet: '10.99.99.0/24'
+
+# IPv6 subnet for VPN clients
+ipv6_subnet: 'fd99:99::/64'
+
+# WireGuard interface name
+wg_interface: 'wg0'
+
+# WireGuard server port
+server_port: 51820
+
+# Directory for WireGuard configuration files
+config_dir: '/etc/wireguard'
+
+# Directory for QR codes
+qr_dir: '/opt/wgm/qr_codes'
+
+# Main network interface (usually eth0, ens3, or similar)
+# Used for NAT/routing rules
+interface_name: 'eth0'
+
+# Server keys (auto-generated on first run if empty)
+server_public_key: ''
+server_private_key: ''
+
+# Server endpoint (auto-detected if empty)
+# Can be FQDN or IP address
+endpoint: ''
+
+# Default tunnel mode for new clients
+# true = full tunnel (all traffic), false = split tunnel (VPN subnet only)
+full_tunnel: false
+
+# DNS domain for internal VPN names
+# Auto-detected on first run if empty
+dns_domain: ''
+
+# Custom DNS overrides - map domains to specific IP addresses
+# Supports wildcards with quoted keys: "*.dev.local": 10.0.0.1
+dns_overrides:
+  # example.com: 1.1.1.1
+  # api.internal: 192.168.1.100
+  # blocked-ads.com: 0.0.0.0
+
+# Whether dnsmasq should read /etc/hosts for DNS resolution
+# true = read /etc/hosts (default), false = ignore /etc/hosts (VPN-only DNS)
+dnsmasq_read_etc_hosts: true

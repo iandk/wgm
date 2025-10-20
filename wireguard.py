@@ -12,6 +12,7 @@ import sys
 import os
 import yaml
 import requests
+import hashlib
 from typing import Dict, List, Optional, Tuple, Set, Union
 from dataclasses import dataclass, asdict, field
 from rich import box
@@ -35,8 +36,8 @@ console = Console()
 @dataclass
 class WireGuardConfig:
     """WireGuard server configuration."""
-    ipv4_subnet: str = '10.0.0.0/24'
-    ipv6_subnet: str = 'fd00::/64'
+    ipv4_subnet: str = '10.99.99.0/24'
+    ipv6_subnet: str = 'fd99:99::/64'
     wg_interface: str = 'wg0'
     server_port: int = 51820
     config_dir: str = '/etc/wireguard'
@@ -47,7 +48,8 @@ class WireGuardConfig:
     endpoint: str = ''
     full_tunnel: bool = False
     dns_domain: str = ''
-    dnsmasq_address_rules: List[str] = field(default_factory=list)
+    dns_overrides: Dict[str, str] = field(default_factory=dict)
+    dnsmasq_read_etc_hosts: bool = True
 
     @classmethod
     def from_dict(cls, config_dict: Dict) -> 'WireGuardConfig':
@@ -77,30 +79,256 @@ class WireGuardManager:
         # Use absolute paths based on script location
         self.config_path = (self.script_dir / config_path).resolve()
         self.clients_file = self.script_dir / 'clients.json'
+        self.config_hash_file = self.script_dir / '.config_hash'
 
-        self.config = self._load_config()
+        # Strict check: verify system dependencies exist
+        self._verify_system_dependencies()
+
+        # Soft check: load or bootstrap configuration
+        self.config = self._load_or_create_config()
         self.clients: Dict[str, WireGuardClient] = {}
         self._load_clients()
 
-    def _load_config(self) -> WireGuardConfig:
-        """Load configuration from file or create default."""
-        if self.config_path.exists():
-            try:
-                with open(self.config_path) as f:
-                    return WireGuardConfig.from_dict(yaml.safe_load(f) or {})
-            except Exception as e:
-                logger.error(f"Failed to load config: {e}")
-                sys.exit(1)
-        return WireGuardConfig()
+        # Check if config changed and update if needed
+        self._check_config_changes()
 
-    def _save_config(self) -> None:
-        """Save configuration to file."""
+    def _verify_system_dependencies(self) -> None:
+        """Verify critical system dependencies are installed."""
+        missing = []
+
+        if not Path('/usr/bin/wg').exists():
+            missing.append("wireguard")
+        if not Path('/usr/sbin/dnsmasq').exists():
+            missing.append("dnsmasq")
+
+        if missing:
+            console.print(f"[red]Error: Required packages not installed: {', '.join(missing)}[/red]")
+            console.print("\n[yellow]Please run the installation script:[/yellow]")
+            console.print("  bash /opt/wgm/install.sh")
+            sys.exit(1)
+
+    def _load_or_create_config(self) -> WireGuardConfig:
+        """Load existing config or create from example template."""
+        # If config.yaml doesn't exist, copy from example
+        if not self.config_path.exists():
+            example_path = self.script_dir / 'config.example.yaml'
+            if not example_path.exists():
+                console.print(f"[red]Error: Example configuration file not found: {example_path}[/red]")
+                console.print("\n[yellow]Please ensure config.example.yaml exists or run:[/yellow]")
+                console.print("  bash /opt/wgm/install.sh")
+                sys.exit(1)
+
+            console.print("[yellow]No configuration found. Creating config.yaml from example...[/yellow]")
+            import shutil
+            shutil.copy(example_path, self.config_path)
+
+        # Load the config
         try:
+            with open(self.config_path) as f:
+                config = WireGuardConfig.from_dict(yaml.safe_load(f) or {})
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+            sys.exit(1)
+
+        # Smart bootstrap: auto-fill missing critical runtime values
+        needs_save = False
+
+        if not config.server_private_key:
+            console.print("[yellow]Generating server keypair...[/yellow]")
+            private_key, public_key = self._generate_keypair()
+            config.server_private_key = private_key
+            config.server_public_key = public_key
+            needs_save = True
+
+        if not config.endpoint:
+            console.print("[yellow]Auto-detecting server endpoint...[/yellow]")
+            config.endpoint = self._get_server_endpoint()
+            console.print(f"[green]Detected endpoint: {config.endpoint}[/green]")
+            needs_save = True
+
+        if not config.dns_domain:
+            console.print("[yellow]Auto-detecting DNS domain...[/yellow]")
+            config.dns_domain = self._get_dns_domain()
+            console.print(f"[green]Using DNS domain: {config.dns_domain}[/green]")
+            needs_save = True
+
+        # Ensure critical directories exist
+        Path(config.config_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+        Path(config.qr_dir).mkdir(mode=0o755, parents=True, exist_ok=True)
+
+        # Save if we made changes
+        if needs_save:
+            self._save_config_internal(config)
+            console.print("[green]Configuration initialized successfully![/green]")
+
+        # Ensure WireGuard interface is set up
+        self._ensure_interface_ready(config)
+
+        return config
+
+    def _save_config_internal(self, config: WireGuardConfig) -> None:
+        """Internal method to save config preserving comments from example."""
+        try:
+            # Read the current config (which should be a copy of example with comments)
+            with open(self.config_path, 'r') as f:
+                lines = f.readlines()
+
+            # Update values while preserving comments and structure
+            config_dict = asdict(config)
+            new_lines = []
+
+            for line in lines:
+                stripped = line.strip()
+
+                # Preserve comments and empty lines
+                if stripped.startswith('#') or not stripped:
+                    new_lines.append(line)
+                    continue
+
+                # Update values
+                if ':' in line:
+                    key = line.split(':')[0].strip()
+                    if key in config_dict:
+                        value = config_dict[key]
+                        # Format the value properly
+                        if isinstance(value, str):
+                            new_lines.append(f"{key}: '{value}'\n")
+                        elif isinstance(value, bool):
+                            new_lines.append(f"{key}: {'true' if value else 'false'}\n")
+                        elif isinstance(value, list):
+                            if value:
+                                new_lines.append(f"{key}: {value}\n")
+                            else:
+                                new_lines.append(f"{key}: []\n")
+                        else:
+                            new_lines.append(f"{key}: {value}\n")
+                    else:
+                        new_lines.append(line)
+                else:
+                    new_lines.append(line)
+
+            # Write back
             with open(self.config_path, 'w') as f:
-                yaml.safe_dump(asdict(self.config), f)
+                f.writelines(new_lines)
+
         except Exception as e:
             logger.error(f"Failed to save config: {e}")
             sys.exit(1)
+
+    def _ensure_interface_ready(self, config: WireGuardConfig) -> None:
+        """Ensure WireGuard interface and basic networking is configured."""
+        try:
+            # Enable IP forwarding if not already enabled
+            ipv4_forward = Path('/proc/sys/net/ipv4/ip_forward').read_text().strip()
+            ipv6_forward = Path('/proc/sys/net/ipv6/conf/all/forwarding').read_text().strip()
+
+            if ipv4_forward != '1' or ipv6_forward != '1':
+                console.print("[yellow]Enabling IP forwarding...[/yellow]")
+                with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
+                    f.write('1\n')
+                with open('/proc/sys/net/ipv6/conf/all/forwarding', 'w') as f:
+                    f.write('1\n')
+
+                # Make forwarding persistent
+                sysctl_conf = Path('/etc/sysctl.d/99-wireguard.conf')
+                sysctl_conf.write_text(
+                    "net.ipv4.ip_forward=1\n"
+                    "net.ipv6.conf.all.forwarding=1\n"
+                )
+        except Exception as e:
+            logger.warning(f"Could not ensure interface ready: {e}")
+
+    def _compute_config_hash(self) -> str:
+        """Compute hash of config fields that affect DNS/client configs."""
+        # Only hash fields that matter for DNS and client configs
+        relevant_fields = {
+            'dns_domain': self.config.dns_domain,
+            'endpoint': self.config.endpoint,
+            'server_port': self.config.server_port,
+            'dns_overrides': self.config.dns_overrides,
+            'dnsmasq_read_etc_hosts': self.config.dnsmasq_read_etc_hosts,
+        }
+        config_str = json.dumps(relevant_fields, sort_keys=True)
+        return hashlib.sha256(config_str.encode()).hexdigest()
+
+    def _check_config_changes(self) -> None:
+        """Check if config changed and update DNS/client configs if needed."""
+        try:
+            current_hash = self._compute_config_hash()
+
+            # Read stored hash
+            if self.config_hash_file.exists():
+                stored_hash = self.config_hash_file.read_text().strip()
+
+                if stored_hash != current_hash:
+                    console.print("[yellow]Configuration changes detected, updating...[/yellow]")
+
+                    # Update DNS configuration
+                    if self.clients:
+                        self._update_dns_config()
+
+                        # Regenerate client configs if endpoint or port changed
+                        self._regenerate_client_configs()
+
+                    # Save new hash
+                    self.config_hash_file.write_text(current_hash)
+                    console.print("[green]Configuration updated successfully![/green]")
+            else:
+                # First run, save hash
+                self.config_hash_file.write_text(current_hash)
+
+        except Exception as e:
+            logger.warning(f"Failed to check config changes: {e}")
+
+    def _regenerate_client_configs(self) -> None:
+        """Regenerate all client configuration files with updated endpoint/domain."""
+        try:
+            console.print("[yellow]Regenerating client configurations...[/yellow]")
+
+            for name, client in self.clients.items():
+                # Read the private key from existing config
+                config_path = Path(self.config.config_dir) / f"{name}.conf"
+                if not config_path.exists():
+                    logger.warning(f"Config file not found for client {name}, skipping")
+                    continue
+
+                # Extract private key from existing config
+                config_content = config_path.read_text()
+                private_key = None
+                for line in config_content.split('\n'):
+                    if line.startswith('PrivateKey'):
+                        private_key = line.split('=')[1].strip()
+                        break
+
+                if not private_key:
+                    logger.warning(f"Could not find private key for client {name}, skipping")
+                    continue
+
+                # Generate new config with updated endpoint/domain
+                new_config = self._create_client_config(client, private_key)
+                config_path.write_text(new_config)
+
+                # Regenerate QR code
+                qr_path = Path(self.config.qr_dir) / f"{name}_qr.png"
+                try:
+                    self._run_command([
+                        'qrencode',
+                        '-t', 'png',
+                        '-o', str(qr_path),
+                        '-s', '2',
+                        '-m', '1'
+                    ], input_data=new_config)
+                except Exception as e:
+                    logger.warning(f"Failed to regenerate QR code for {name}: {e}")
+
+            console.print(f"[green]Regenerated configs for {len(self.clients)} client(s)[/green]")
+
+        except Exception as e:
+            logger.error(f"Failed to regenerate client configs: {e}")
+
+    def _save_config(self) -> None:
+        """Save configuration to file preserving comments."""
+        self._save_config_internal(self.config)
 
     def _load_clients(self) -> None:
         """Load clients from JSON file."""
@@ -173,28 +401,22 @@ class WireGuardManager:
 
             # Fallback to public IP
             response = requests.get(
-                'https://api.ipify.org/?format=json',
+                'https://getip.sh',
                 timeout=5
             )
-            return response.json()['ip']
+            ip = response.json()['ip'] or None
+            
+            if not ip:
+                raise ValueError("Failed to get public IP")
+            
+            return ip
         except Exception as e:
             logger.warning(f"Failed to get server endpoint: {e}")
-            # Final fallback to local IP
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            return local_ip
+            raise e
+            
 
     def _get_dns_domain(self) -> str:
         """Get a default DNS domain if not set."""
-        try:
-            fqdn = socket.getfqdn()
-            # Check for a reasonably valid FQDN
-            if fqdn and '.' in fqdn and not fqdn.endswith('.internal') and not fqdn.endswith('.localdomain'):
-                return fqdn
-        except Exception:
-            pass  # Fallback to default
         return 'vpn.local'
 
     def _get_next_available_ips(self) -> Dict[str, str]:
@@ -242,10 +464,12 @@ class WireGuardManager:
             # Set endpoint if not configured
             if not self.config.endpoint:
                 self.config.endpoint = self._get_server_endpoint()
+                logger.info(f"Detected server endpoint: {self.config.endpoint}")
 
             # Set DNS domain if not configured
             if not self.config.dns_domain:
                 self.config.dns_domain = self._get_dns_domain()
+                logger.info(f"Detected DNS domain: {self.config.dns_domain}")
 
             # Ensure forwarding is enabled
             with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
@@ -594,7 +818,7 @@ class WireGuardManager:
         wrapped = '\\\n'.join([encoded[i:i+50] for i in range(0, len(encoded), 50)])
 
         # Return wrapped command
-        return f"echo \\\n{wrapped} | base64 -d | sudo bash"
+        return f"echo \\\n{wrapped} | base64 -d | bash"
 
     def add_client(self, name: str, full_tunnel: Optional[bool] = None,
                    restricted_ips: Optional[List[str]] = None,
@@ -675,15 +899,72 @@ class WireGuardManager:
 
             # Print success and show configuration
             console.print(f"\n[bold green]Successfully created client {name}[/bold green]")
-            self.show_client_config(name, config_content, show_qr=False)
+            self.show_client_config(name, config_content, show_qr=True)
 
         except Exception as e:
             logger.error(f"Failed to add client: {e}")
             raise
 
+    def _check_hosts_conflicts(self) -> None:
+        """Check for conflicts between VPN names and /etc/hosts."""
+        try:
+            if not Path('/etc/hosts').exists():
+                return
+
+            # Read /etc/hosts
+            hosts_content = Path('/etc/hosts').read_text()
+
+            # Build list of VPN hostnames we're using
+            vpn_names = set()
+            dns_domain = self.config.dns_domain
+
+            # Add server name
+            if dns_domain:
+                dns_domain_short = dns_domain.split('.')[0]
+                vpn_names.add(dns_domain_short)
+                vpn_names.add(dns_domain)
+
+            # Add client names
+            for client in self.clients.values():
+                vpn_names.add(client.name)
+                if dns_domain:
+                    vpn_names.add(f"{client.name}.{dns_domain}")
+
+            # Check for conflicts
+            conflicts = []
+            for line in hosts_content.split('\n'):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+
+                ip = parts[0]
+                hostnames = parts[1:]
+
+                for hostname in hostnames:
+                    if hostname in vpn_names:
+                        conflicts.append(f"{hostname} ({ip})")
+
+            if conflicts:
+                console.print("\n[yellow]⚠️  Warning: Conflicting entries found in /etc/hosts:[/yellow]")
+                for conflict in conflicts:
+                    console.print(f"  • {conflict}")
+                console.print("\n[yellow]These may cause DNS resolution issues for VPN clients.[/yellow]")
+                console.print("[yellow]Consider setting 'dnsmasq_read_etc_hosts: false' in config.yaml[/yellow]\n")
+
+        except Exception as e:
+            logger.warning(f"Failed to check /etc/hosts conflicts: {e}")
+
     def _update_dns_config(self) -> None:
         """Update DNS configuration for client name resolution."""
         try:
+            # Check for conflicts if reading /etc/hosts
+            if self.config.dnsmasq_read_etc_hosts:
+                self._check_hosts_conflicts()
+
             # Wait for WireGuard interface to be up
             retries = 5
             while retries > 0 and not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
@@ -715,7 +996,6 @@ class WireGuardManager:
                 'bind-interfaces',
                 f'domain={dns_domain}',
                 'expand-hosts',
-                f'local=/{dns_domain}/',
                 'domain-needed',
                 'bogus-priv',
                 'no-resolv',
@@ -724,26 +1004,30 @@ class WireGuardManager:
                 'server=1.0.0.1',
             ]
 
+            # Add no-hosts option if configured
+            if not self.config.dnsmasq_read_etc_hosts:
+                config_lines.insert(5, 'no-hosts')  # Insert after 'bind-interfaces'
 
-            # Add custom address rules from config
-            if self.config.dnsmasq_address_rules:
-                for rule in self.config.dnsmasq_address_rules:
-                    config_lines.append(f"address={rule}")
+            # Add DNS overrides from config
+            if self.config.dns_overrides:
+                for domain, ip in self.config.dns_overrides.items():
+                    config_lines.append(f"address=/{domain}/{ip}")
 
             config_lines.append('')  # End with newline
             
             # Add client host entries
             hosts_lines = []
             server_ip = self._get_server_ips().split(',')[0].split('/')[0]
-            hosts_lines.append(f"{server_ip} {dns_domain} {dns_domain_short}")
+            # Add server entry with short name (expand-hosts will add .ian.coffee)
+            hosts_lines.append(f"{server_ip} {dns_domain_short}")
 
             for client in self.clients.values():
                 client_ip = client.ipv4.split('/')[0]
                 client_ip6 = client.ipv6.split('/')[0]
-                base_name = f"{client.name}.vpn.local"
+                # Use short names - expand-hosts will automatically add domain suffix
                 hosts_lines.extend([
-                    f"{client_ip} {base_name} {client.name}",
-                    f"{client_ip6} {base_name} {client.name}"
+                    f"{client_ip} {client.name}",
+                    f"{client_ip6} {client.name}"
                 ])
             hosts_lines.append('')  # End with newline
 
@@ -855,14 +1139,14 @@ class WireGuardManager:
             # Also display QR code in terminal
             if show_qr:
                 try:
-                    console.print("\n[yellow]Terminal QR Code:[/yellow]")
+                    console.print("\n[bold blue]QR Code:[/bold blue]")
                     qr_terminal = subprocess.run(
-                        ['qrencode', '-t', 'ansi', '-m', '1', '-s', '1', '-o', str(qr_path)],
-                        input=config_content,
+                        ['qrencode', '-t', 'ansiutf8', '-m', '1'],
+                        input=config_content.encode(),
                         capture_output=True,
-                        text=True
+                        text=False
                     )
-                    print(qr_terminal.stdout)
+                    print(qr_terminal.stdout.decode())
                 except Exception as e:
                     logger.warning(f"Failed to generate terminal QR code: {e}")
 
@@ -1039,9 +1323,6 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Initialize command
-    subparsers.add_parser("init", help="Initialize WireGuard server")
-
     # Add client command
     add_parser = subparsers.add_parser("add", help="Add a new client")
     add_parser.add_argument("name", help="Client name")
@@ -1077,10 +1358,7 @@ def main():
     try:
         manager = WireGuardManager(args.config)
 
-        if args.command == "init":
-            manager.initialize()
-
-        elif args.command == "add":
+        if args.command == "add":
             if args.full_tunnel and args.split_tunnel:
                 console.print("[red]Cannot specify both --full-tunnel and --split-tunnel[/red]")
                 sys.exit(1)
