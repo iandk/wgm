@@ -22,12 +22,34 @@ wgm add laptop
 # Add client (full tunnel - all traffic)
 wgm add phone --full-tunnel
 
+# Add client (full tunnel with public IP exclusion)
+# Preserves direct access to client via its public IPs
+wgm add server --full-tunnel --exclude-public-ips
+
 # Show client config, QR code & install command
 wgm config laptop
 
 # Remove client
 wgm remove laptop
 ```
+
+## Full Tunnel with Public IP Exclusion
+
+For servers that need full tunnel VPN while remaining accessible via their public IP:
+
+```bash
+# Add server with full tunnel that preserves direct access
+wgm add myserver --full-tunnel --exclude-public-ips
+```
+
+This dynamically excludes the client's public IPv4 and IPv6 addresses from VPN routing using policy routing rules, allowing:
+- ✅ All outbound traffic routes through VPN
+- ✅ Direct access to the server via its public IP(s)
+- ✅ Automatic detection of both IPv4 and IPv6 public IPs
+
+**Use cases:**
+- Remote servers that need VPN access but must remain SSH-accessible
+- Services that need to be directly reachable while routing all other traffic through VPN
 
 ## IP Restrictions
 

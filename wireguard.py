@@ -66,6 +66,7 @@ class WireGuardClient:
     allowed_ips: List[str]
     restricted_ips: List[str] = field(default_factory=list)  # IPv4 restrictions
     restricted_ip6s: List[str] = field(default_factory=list)  # IPv6 restrictions
+    exclude_public_ips: bool = False  # Whether public IPs are excluded from VPN routing
     created_at: str = ''
 
 
@@ -803,24 +804,24 @@ class WireGuardManager:
 
     def _create_install_command(self, client_config: str, interface_name: str = 'wg0') -> str:
         """Create installation command using base64 encoding with line wrapping."""
+       
         install_script = (
-            f"echo 'nameserver 1.1.1.1' > /tmp/resolv.conf.wgm && "
-            f"mount --bind /tmp/resolv.conf.wgm /etc/resolv.conf && "
-            f"wg-quick down wg0 || true && "
-            f"rm -f /etc/wireguard/wg0.conf && "
-            f"apt update && "
-            f"apt install -y wireguard resolvconf && "
-            f"resolvconf -u &&"
-            f"wg-quick down {interface_name} 2>/dev/null || true && "
-            f"rm -f /etc/wireguard/{interface_name}.conf && "
-            f"cat > /etc/wireguard/{interface_name}.conf << EOF\n"
+            f"mv -f /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true && "
+            f"ln -sf /run/resolvconf/resolv.conf /etc/resolv.conf && "
+            f"echo 'nameserver 1.1.1.1' > /etc/resolvconf/resolv.conf.d/head && "
+            f"resolvconf -u && "
+            f"wg-quick down {interface_name} || true && "
+            f"rm -f /etc/wireguard/{interface_name}.conf || true && "
+            f"for pkg in wireguard resolvconf; do dpkg -s $pkg >/dev/null 2>&1 || apt install -y $pkg; done && "
+            f"resolvconf -u && "
+            f"cat > /etc/wireguard/{interface_name}.conf << 'EOF'\n"
             f"{client_config}\n"
             f"EOF\n"
             f"chmod 600 /etc/wireguard/{interface_name}.conf && "
             f"systemctl enable wg-quick@{interface_name} && "
             f"wg-quick up {interface_name} && "
-            f"umount /etc/resolv.conf && "
-            f"rm -f /tmp/resolv.conf.wgm"
+            f"sed -i '/^nameserver 1\\.1\\.1\\.1$/d' /etc/resolvconf/resolv.conf.d/head || true && "
+            f"resolvconf -u"
         )
 
         # Encode the script and wrap at 50 characters
@@ -832,7 +833,9 @@ class WireGuardManager:
 
     def add_client(self, name: str, full_tunnel: Optional[bool] = None,
                    restricted_ips: Optional[List[str]] = None,
-                   restricted_ip6s: Optional[List[str]] = None) -> None:
+                   restricted_ip6s: Optional[List[str]] = None,
+                   exclude_ip: Optional[str] = None,
+                   exclude_public_ips: bool = False) -> None:
         """Add a new WireGuard client."""
         try:
             if name in self.clients:
@@ -854,16 +857,36 @@ class WireGuardManager:
                     except ValueError as e:
                         raise ValueError(f"Invalid IPv6 address/network: {ip}")
 
+            # Validate exclude_ip if provided
+            if exclude_ip:
+                try:
+                    ipaddress.ip_address(exclude_ip)
+                except ValueError as e:
+                    raise ValueError(f"Invalid IP address to exclude: {exclude_ip}")
+
             # Generate client keys and get IPs
             private_key, public_key = self._generate_keypair()
             ips = self._get_next_available_ips()
 
             # Set tunnel mode
             use_full_tunnel = full_tunnel if full_tunnel is not None else self.config.full_tunnel
-            allowed_ips = ['0.0.0.0/0', '::/0'] if use_full_tunnel else [
-                self.config.ipv4_subnet,
-                self.config.ipv6_subnet
-            ]
+
+            # Calculate allowed IPs based on tunnel mode and exclusions
+            if use_full_tunnel:
+                if exclude_ip:
+                    # Full tunnel but exclude specific IP
+                    allowed_ips = self._calculate_allowed_ips_excluding(exclude_ip)
+                    allowed_ips.append('::/0')  # Keep IPv6 full tunnel
+                    console.print(f"[yellow]Creating full tunnel excluding {exclude_ip}[/yellow]")
+                else:
+                    allowed_ips = ['0.0.0.0/0', '::/0']
+                    if exclude_public_ips:
+                        console.print(f"[yellow]Creating full tunnel with dynamic public IP exclusion[/yellow]")
+            else:
+                allowed_ips = [
+                    self.config.ipv4_subnet,
+                    self.config.ipv6_subnet
+                ]
 
             # Create client
             client = WireGuardClient(
@@ -874,11 +897,12 @@ class WireGuardManager:
                 allowed_ips=allowed_ips,
                 restricted_ips=restricted_ips or [],
                 restricted_ip6s=restricted_ip6s or [],
+                exclude_public_ips=exclude_public_ips,
                 created_at=datetime.now().isoformat()
             )
 
             # Generate client config
-            config_content = self._create_client_config(client, private_key)
+            config_content = self._create_client_config(client, private_key, exclude_public_ips)
 
             # Save client config
             config_path = Path(self.config.config_dir) / f"{name}.conf"
@@ -1124,16 +1148,78 @@ nameserver 1.1.1.1
             logger.error(f"Failed to update DNS configuration: {e}")
             raise
 
-    def _create_client_config(self, client: WireGuardClient, private_key: str) -> str:
+    def _calculate_allowed_ips_excluding(self, exclude_ip: str) -> List[str]:
+        """Calculate AllowedIPs for full tunnel excluding a specific IP.
+
+        Uses CIDR notation to create a list of IP ranges that covers 0.0.0.0/0
+        except for the excluded IP.
+        """
+        import ipaddress
+
+        try:
+            excluded = ipaddress.ip_address(exclude_ip)
+            all_ips = ipaddress.ip_network('0.0.0.0/0')
+
+            # Create a list of networks excluding the single IP
+            result = list(all_ips.address_exclude(ipaddress.ip_network(f'{exclude_ip}/32')))
+
+            # Convert to strings
+            return [str(net) for net in result]
+        except Exception as e:
+            logger.warning(f"Failed to calculate excluded IPs: {e}")
+            # Fallback to full tunnel
+            return ['0.0.0.0/0']
+
+    def _create_client_config(self, client: WireGuardClient, private_key: str, exclude_public_ips: bool = False) -> str:
         """Create client configuration."""
         # Get server IP for DNS
         server_ip = self._get_server_ips().split(',')[0].split('/')[0]
 
-        return '\n'.join([
+        config_lines = [
             '[Interface]',
             f'PrivateKey = {private_key}',
             f'Address = {client.ipv4}, {client.ipv6}',
             f'DNS = {server_ip}',  # Point to WireGuard server for DNS
+        ]
+
+        # Add PostUp/PreDown for excluding public IPs in full tunnel mode
+        if exclude_public_ips and "0.0.0.0/0" in client.allowed_ips:
+            # PostUp: Detect and preserve both IPv4 and IPv6 public IPs
+            postup_lines = []
+            predown_lines = []
+
+            # IPv4 preservation
+            postup_lines.append(
+                "DEFAULT_IF=$(ip route show default | awk '{print $5}' | head -1); "
+                "PUBLIC_IP=$(ip -4 addr show $DEFAULT_IF 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}' | head -1); "
+                "[ -n \"$PUBLIC_IP\" ] && ip rule add from $PUBLIC_IP lookup main priority 100 || true"
+            )
+            predown_lines.append(
+                "DEFAULT_IF=$(ip route show default | awk '{print $5}' | head -1); "
+                "PUBLIC_IP=$(ip -4 addr show $DEFAULT_IF 2>/dev/null | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}' | head -1); "
+                "[ -n \"$PUBLIC_IP\" ] && ip rule del from $PUBLIC_IP lookup main priority 100 2>/dev/null || true"
+            )
+
+            # IPv6 preservation
+            postup_lines.append(
+                "DEFAULT_IF=$(ip -6 route show default | awk '{print $5}' | head -1); "
+                "PUBLIC_IP6=$(ip -6 addr show $DEFAULT_IF 2>/dev/null | grep -oP '(?<=inet6\\s)([0-9a-f:]+)(?=/[0-9]+ scope global)' | head -1); "
+                "[ -n \"$PUBLIC_IP6\" ] && ip -6 rule add from $PUBLIC_IP6 lookup main priority 100 || true"
+            )
+            predown_lines.append(
+                "DEFAULT_IF=$(ip -6 route show default | awk '{print $5}' | head -1); "
+                "PUBLIC_IP6=$(ip -6 addr show $DEFAULT_IF 2>/dev/null | grep -oP '(?<=inet6\\s)([0-9a-f:]+)(?=/[0-9]+ scope global)' | head -1); "
+                "[ -n \"$PUBLIC_IP6\" ] && ip -6 rule del from $PUBLIC_IP6 lookup main priority 100 2>/dev/null || true"
+            )
+
+            # Add comment
+            config_lines.append('# Preserve access to public IP(s) by using policy routing')
+
+            # Combine all PostUp commands with semicolons
+            config_lines.append(f'PostUp = {"; ".join(postup_lines)}')
+            config_lines.append(f'PreDown = {"; ".join(predown_lines)}')
+
+        config_lines.extend([
             '',
             '[Peer]',
             f'PublicKey = {self.config.server_public_key}',
@@ -1142,6 +1228,8 @@ nameserver 1.1.1.1
             'PersistentKeepalive = 10',
             ''  # Add empty string to create final newline
         ])
+
+        return '\n'.join(config_lines)
 
     def show_client_config(self, name: str, config_content: Optional[str] = None, show_qr: bool = False) -> None:
         """Show configuration details for a client.
@@ -1289,7 +1377,7 @@ nameserver 1.1.1.1
             table.add_column("Name", style="bold blue")
             table.add_column("Status", style="")
             table.add_column("Addresses", style="")
-            table.add_column("Tunnel Mode", style="")
+            table.add_column("Tunnel Mode", style="", min_width=30)
             table.add_column("Restrictions", style="", max_width=40)
             table.add_column("Last Seen", style="")
             table.add_column("Created", style="dim")
@@ -1298,7 +1386,15 @@ nameserver 1.1.1.1
             pubkey_to_name = {client.public_key: name for name, client in self.clients.items()}
 
             for name, client in sorted(self.clients.items()):
-                tunnel_mode = "[blue]Full[/blue]" if "0.0.0.0/0" in client.allowed_ips else "[yellow]Split[/yellow]"
+                # Determine tunnel mode with exclude_public_ips indicator
+                if "0.0.0.0/0" in client.allowed_ips:
+                    if client.exclude_public_ips:
+                        tunnel_mode = "[blue]Full[/blue] [dim](public IPs excluded)[/dim]"
+                    else:
+                        tunnel_mode = "[blue]Full[/blue]"
+                else:
+                    tunnel_mode = "[yellow]Split[/yellow]"
+
                 # in german format
                 created = datetime.fromisoformat(client.created_at).strftime("%d.%m.%Y %H:%M") if client.created_at else "Unknown"
 
@@ -1353,40 +1449,126 @@ nameserver 1.1.1.1
 
 
 def main():
-    parser = argparse.ArgumentParser(description="WireGuard VPN Manager")
+    parser = argparse.ArgumentParser(
+        description="WireGuard VPN Manager - Manage WireGuard server and clients with integrated DNS",
+        epilog="""
+Examples:
+  wgm list                                      List all clients with status
+  wgm add laptop                                Add client (split tunnel - VPN subnet only)
+  wgm add phone --full-tunnel                   Add client (full tunnel - all traffic via VPN)
+  wgm add server --full --exclude-public-ips    Full tunnel, preserve direct access
+  wgm config laptop                             Show config, QR code & install command
+  wgm remove laptop                             Remove client
+
+Tunnel Modes:
+  Split Tunnel  Routes only VPN subnet traffic (default)
+  Full Tunnel   Routes all traffic through VPN (--full-tunnel)
+                Use --exclude-public-ips to preserve direct access to client
+
+For more info: https://github.com/iandk/wgm
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("-c", "--config", default="config.yaml", help="Path to config file")
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="COMMAND",
+        help="Available commands"
+    )
 
     # Add client command
-    add_parser = subparsers.add_parser("add", help="Add a new client")
-    add_parser.add_argument("name", help="Client name")
-    add_parser.add_argument("--full-tunnel", "--full", action="store_true", help="Use full tunnel mode")
-    add_parser.add_argument("--split-tunnel", "--split", action="store_true", help="Use split tunnel mode")
-    add_parser.add_argument("--restrict-to", nargs="+", metavar="IP",
-                            help="List of IP addresses/networks this client can access (both IPv4 and IPv6)")
+    add_parser = subparsers.add_parser(
+        "add",
+        help="Add a new client",
+        description="Add a new WireGuard client with optional tunnel mode and restrictions"
+    )
+    add_parser.add_argument("name", help="Client name (e.g., laptop, phone, server)")
+    add_parser.add_argument(
+        "--full-tunnel", "--full",
+        action="store_true",
+        help="Route all traffic through VPN (default: split tunnel)"
+    )
+    add_parser.add_argument(
+        "--split-tunnel", "--split",
+        action="store_true",
+        help="Route only VPN subnet traffic (default behavior)"
+    )
+    add_parser.add_argument(
+        "--exclude-public-ips",
+        action="store_true",
+        help="Full tunnel only: preserve direct access to client via its public IPs (IPv4 & IPv6)"
+    )
+    add_parser.add_argument(
+        "--exclude-ip",
+        metavar="IP",
+        help="Full tunnel only: exclude specific IP from VPN routing (requires knowing IP in advance)"
+    )
+    add_parser.add_argument(
+        "--restrict-to",
+        nargs="+",
+        metavar="IP",
+        help="Restrict client to only access these IPs/networks (e.g., 192.168.1.0/24 10.0.0.5)"
+    )
 
     # Show config command
-    config_parser = subparsers.add_parser("config", help="Show client configuration details")
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Show client configuration",
+        description="Display client config, QR code, and installation command"
+    )
     config_parser.add_argument("name", help="Client name")
-    config_parser.add_argument("--show-qr", "--qrcode", action="store_true", help="Show QR code in terminal")
+    config_parser.add_argument(
+        "--show-qr", "--qrcode",
+        action="store_true",
+        help="Show QR code in terminal (for mobile devices)"
+    )
+
     # Remove client command
-    remove_parser = subparsers.add_parser("remove", help="Remove a client")
+    remove_parser = subparsers.add_parser(
+        "remove",
+        help="Remove a client",
+        description="Remove a WireGuard client and clean up its configuration"
+    )
     remove_parser.add_argument("name", help="Client name")
-    remove_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+    remove_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip confirmation prompt"
+    )
 
     # List clients command
-    subparsers.add_parser("list", help="List all clients")
+    subparsers.add_parser(
+        "list",
+        help="List all clients",
+        description="Show all clients with status, addresses, tunnel mode, and restrictions"
+    )
 
     # Manage restrictions command
-    restrict_parser = subparsers.add_parser("restrict", help="Manage client IP restrictions")
+    restrict_parser = subparsers.add_parser(
+        "restrict",
+        help="Manage client IP restrictions",
+        description="Add or remove IP restrictions for a specific client"
+    )
     restrict_parser.add_argument("name", help="Client name")
-    restrict_parser.add_argument("--allow", nargs="+", metavar="IP",
-                                 help="Add IP addresses/networks to allowed list")
-    restrict_parser.add_argument("--deny", nargs="+", metavar="IP",
-                                 help="Remove IP addresses/networks from allowed list")
-    restrict_parser.add_argument("--clear", action="store_true",
-                                 help="Remove all IP restrictions")
+    restrict_parser.add_argument(
+        "--allow",
+        nargs="+",
+        metavar="IP",
+        help="Add IP addresses/networks to allowed list (e.g., 192.168.1.0/24)"
+    )
+    restrict_parser.add_argument(
+        "--deny",
+        nargs="+",
+        metavar="IP",
+        help="Remove IP addresses/networks from allowed list"
+    )
+    restrict_parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Remove all IP restrictions (allow all traffic)"
+    )
 
     args = parser.parse_args()
 
@@ -1397,6 +1579,19 @@ def main():
             if args.full_tunnel and args.split_tunnel:
                 console.print("[red]Cannot specify both --full-tunnel and --split-tunnel[/red]")
                 sys.exit(1)
+
+            if args.exclude_ip and not args.full_tunnel:
+                console.print("[yellow]Warning: --exclude-ip only works with --full-tunnel. Ignoring.[/yellow]")
+                args.exclude_ip = None
+
+            if args.exclude_public_ips and not args.full_tunnel:
+                console.print("[yellow]Warning: --exclude-public-ips only works with --full-tunnel. Ignoring.[/yellow]")
+                args.exclude_public_ips = False
+
+            if args.exclude_ip and args.exclude_public_ips:
+                console.print("[red]Cannot use both --exclude-ip and --exclude-public-ips. Choose one.[/red]")
+                sys.exit(1)
+
             full_tunnel = True if args.full_tunnel else False if args.split_tunnel else None
 
             # Split IPs into v4 and v6 automatically
@@ -1413,9 +1608,9 @@ def main():
                     except ValueError as e:
                         console.print(f"[red]Invalid IP address/network: {ip}[/red]")
                         sys.exit(1)
-                manager.add_client(args.name, full_tunnel, ipv4_list, ipv6_list)
+                manager.add_client(args.name, full_tunnel, ipv4_list, ipv6_list, args.exclude_ip, args.exclude_public_ips)
             else:
-                manager.add_client(args.name, full_tunnel)
+                manager.add_client(args.name, full_tunnel, exclude_ip=args.exclude_ip, exclude_public_ips=args.exclude_public_ips)
 
         elif args.command == "config":
             manager.show_client_config(args.name, show_qr=args.show_qr)
