@@ -25,12 +25,29 @@ import argparse
 from datetime import datetime
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+LOG_FILE = '/var/log/wgm.log'
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # Capture all levels, handlers filter
+
+# File handler - log level set from config (default INFO)
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setLevel(logging.INFO)  # Default, updated after config load
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
 console = Console()
+
+
+def configure_log_level(level_str: str) -> None:
+    """Update file handler log level from config."""
+    level_map = {
+        'DEBUG': logging.DEBUG,
+        'INFO': logging.INFO,
+        'WARNING': logging.WARNING,
+        'ERROR': logging.ERROR,
+    }
+    level = level_map.get(level_str.upper(), logging.INFO)
+    file_handler.setLevel(level)
 
 
 @dataclass
@@ -50,6 +67,7 @@ class WireGuardConfig:
     dns_domain: str = ''
     dns_overrides: Dict[str, str] = field(default_factory=dict)
     dnsmasq_read_etc_hosts: bool = True
+    log_level: str = 'INFO'
 
     @classmethod
     def from_dict(cls, config_dict: Dict) -> 'WireGuardConfig':
@@ -87,6 +105,10 @@ class WireGuardManager:
 
         # Soft check: load or bootstrap configuration
         self.config = self._load_or_create_config()
+
+        # Configure logging level from config
+        configure_log_level(self.config.log_level)
+
         self.clients: Dict[str, WireGuardClient] = {}
         self._load_clients()
 
@@ -345,6 +367,7 @@ class WireGuardManager:
 
     def apply_config(self) -> bool:
         """Validate and apply configuration changes. Returns True on success."""
+        logger.info("Starting configuration apply")
         console.print("[cyan]Validating configuration...[/cyan]")
 
         # Run validation
@@ -353,9 +376,11 @@ class WireGuardManager:
             console.print("[red]Configuration validation failed:[/red]")
             for error in errors:
                 console.print(f"  [red]• {error}[/red]")
+                logger.error(f"Validation error: {error}")
             return False
 
         console.print("[green]✓ Configuration valid[/green]")
+        logger.debug("Configuration validation passed")
 
         # Force update by clearing the hash
         if self.config_hash_file.exists():
@@ -384,6 +409,7 @@ class WireGuardManager:
         # Update server config
         self._update_server_config()
         console.print("[green]✓ Updated WireGuard server configuration[/green]")
+        logger.info("Configuration applied successfully")
 
         # Save new hash
         current_hash = self._compute_config_hash()
@@ -396,6 +422,7 @@ class WireGuardManager:
         """Regenerate all client configuration files with updated endpoint/domain."""
         try:
             console.print("[yellow]Regenerating client configurations...[/yellow]")
+            logger.debug(f"Regenerating configs for {len(self.clients)} clients")
 
             for name, client in self.clients.items():
                 # Read the private key from existing config
@@ -419,6 +446,7 @@ class WireGuardManager:
                 # Generate new config with updated endpoint/domain
                 new_config = self._create_client_config(client, private_key)
                 config_path.write_text(new_config)
+                logger.debug(f"Regenerated config for client {name}")
 
                 # Regenerate QR code
                 qr_path = Path(self.config.qr_dir) / f"{name}_qr.png"
@@ -433,6 +461,7 @@ class WireGuardManager:
                 except Exception as e:
                     logger.warning(f"Failed to regenerate QR code for {name}: {e}")
 
+            logger.info(f"Regenerated configs for {len(self.clients)} client(s)")
             console.print(f"[green]Regenerated configs for {len(self.clients)} client(s)[/green]")
 
         except Exception as e:
@@ -576,12 +605,12 @@ class WireGuardManager:
             # Set endpoint if not configured
             if not self.config.endpoint:
                 self.config.endpoint = self._get_server_endpoint()
-                logger.info(f"Detected server endpoint: {self.config.endpoint}")
+                logger.debug(f"Detected server endpoint: {self.config.endpoint}")
 
             # Set DNS domain if not configured
             if not self.config.dns_domain:
                 self.config.dns_domain = self._get_dns_domain()
-                logger.info(f"Detected DNS domain: {self.config.dns_domain}")
+                logger.debug(f"Detected DNS domain: {self.config.dns_domain}")
 
             # Ensure forwarding is enabled
             with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
@@ -740,10 +769,13 @@ class WireGuardManager:
     def _update_server_config(self) -> None:
         """Update WireGuard server configuration."""
         try:
+            logger.debug(f"Updating WireGuard server config for interface {self.config.wg_interface}")
+
             # First try to clean up existing interface
             if Path(f"/sys/class/net/{self.config.wg_interface}").exists():
                 try:
                     # Stop interface if running
+                    logger.debug(f"Bringing down existing interface {self.config.wg_interface}")
                     self._run_command(['wg-quick', 'down', self.config.wg_interface])
                 except Exception as e:
                     logger.warning(f"Failed to bring down interface: {e}")
@@ -795,12 +827,15 @@ class WireGuardManager:
             self._flush_forward_rules()
 
             # Start interface
+            logger.debug(f"Bringing up interface {self.config.wg_interface}")
             self._run_command(['wg-quick', 'up', self.config.wg_interface])
 
             # IMPORTANT: Add restricted client rules FIRST (before unrestricted)
             # This ensures DROP rules are evaluated before broad ACCEPT rules
             restricted_clients = [client for client in self.clients.values()
                                   if client.restricted_ips or client.restricted_ip6s]
+            if restricted_clients:
+                logger.debug(f"Configuring firewall for {len(restricted_clients)} restricted clients")
             for client in restricted_clients:
                 self._update_client_firewall_rules(client)
 
@@ -808,6 +843,8 @@ class WireGuardManager:
             # These come AFTER restricted rules to avoid bypassing restrictions
             unrestricted_clients = [client for client in self.clients.values()
                                     if not client.restricted_ips and not client.restricted_ip6s]
+            if unrestricted_clients:
+                logger.debug(f"Configuring firewall for {len(unrestricted_clients)} unrestricted clients")
 
             for client in unrestricted_clients:
                 client_ip = client.ipv4.split('/')[0]
@@ -977,8 +1014,10 @@ class WireGuardManager:
                    exclude_public_ips: bool = False) -> None:
         """Add a new WireGuard client."""
         try:
+            logger.info(f"Adding new client: {name}")
             if name in self.clients:
                 console.print(f"[red]Client {name} already exists[/red]")
+                logger.warning(f"Client {name} already exists, skipping")
                 return
 
             # Validate IP restrictions if provided
@@ -1070,12 +1109,16 @@ class WireGuardManager:
             self._update_client_firewall_rules(client)
             self._update_server_config()
 
+            tunnel_mode = "full tunnel" if use_full_tunnel else "split tunnel"
+            logger.info(f"Client {name} created successfully: IPv4={ips['ipv4']}, IPv6={ips['ipv6']}, mode={tunnel_mode}")
+            logger.debug(f"Client {name} config saved to {config_path}")
+
             # Print success and show configuration
             console.print(f"\n[bold green]Successfully created client {name}[/bold green]")
             self.show_client_config(name, config_content, show_qr=True)
 
         except Exception as e:
-            logger.error(f"Failed to add client: {e}")
+            logger.error(f"Failed to add client {name}: {e}")
             raise
 
     def _check_hosts_conflicts(self) -> None:
@@ -1136,7 +1179,7 @@ class WireGuardManager:
         try:
             dns_domain = self.config.dns_domain or 'vpn.local'
 
-            logger.info(f"Updating /etc/resolv.conf with DNS domain: {dns_domain}")
+            logger.debug(f"Updating /etc/resolv.conf with DNS domain: {dns_domain}")
 
             resolv_path = Path('/etc/resolv.conf')
 
@@ -1144,7 +1187,7 @@ class WireGuardManager:
             if resolv_path.is_symlink():
                 target = resolv_path.resolve()
                 if not target.exists():
-                    logger.info(f"Removing broken symlink {resolv_path} -> {os.readlink(resolv_path)}")
+                    console.print(f"[yellow]  Removing broken symlink → creating new file[/yellow]")
                     resolv_path.unlink()
 
             # Remove immutable flag if present
@@ -1168,6 +1211,8 @@ nameserver 1.1.1.1
     def _update_dns_config(self) -> None:
         """Update DNS configuration for client name resolution."""
         try:
+            logger.debug(f"Updating DNS configuration for {len(self.clients)} clients")
+
             # Check for conflicts if reading /etc/hosts
             if self.config.dnsmasq_read_etc_hosts:
                 self._check_hosts_conflicts()
@@ -1217,8 +1262,10 @@ nameserver 1.1.1.1
 
             # Add DNS overrides from config
             if self.config.dns_overrides:
+                logger.debug(f"Adding {len(self.config.dns_overrides)} DNS overrides")
                 for domain, ip in self.config.dns_overrides.items():
                     config_lines.append(f"address=/{domain}/{ip}")
+                    logger.debug(f"  DNS override: {domain} -> {ip}")
 
             config_lines.append('')  # End with newline
             
@@ -1274,6 +1321,7 @@ nameserver 1.1.1.1
 
             # Restart dnsmasq with proper error handling
             try:
+                logger.debug("Restarting dnsmasq service")
                 self._run_command(['systemctl', 'restart', 'dnsmasq'])
                 time.sleep(1)  # Give it time to settle
 
@@ -1281,6 +1329,7 @@ nameserver 1.1.1.1
                 status = self._run_command(['systemctl', 'is-active', 'dnsmasq'])
                 if status != 'active':
                     raise RuntimeError(f"dnsmasq failed to start, status: {status}")
+                logger.debug("dnsmasq restarted successfully")
 
             except Exception as e:
                 logger.error(f"Failed to restart dnsmasq: {e}")
@@ -1451,31 +1500,39 @@ nameserver 1.1.1.1
         try:
             if name not in self.clients:
                 console.print(f"[red]Client {name} not found[/red]")
+                logger.warning(f"Attempted to remove non-existent client: {name}")
                 return
 
             # Confirm deletion unless skip_confirm is True
             if not skip_confirm and not Confirm.ask(f"Are you sure you want to remove client {name}?"):
+                logger.debug(f"Client removal cancelled by user: {name}")
                 return
+
+            logger.info(f"Removing client: {name}")
+            client = self.clients[name]
 
             # Remove client config file
             config_path = Path(self.config.config_dir) / f"{name}.conf"
             if config_path.exists():
                 config_path.unlink()
+                logger.debug(f"Removed config file: {config_path}")
 
             # Remove QR code if exists
             qr_path = Path(self.config.qr_dir) / f"{name}_qr.png"
             if qr_path.exists():
                 qr_path.unlink()
+                logger.debug(f"Removed QR code: {qr_path}")
 
             # Remove client and update
             del self.clients[name]
             self._save_clients()
             self._update_server_config()
 
+            logger.info(f"Client {name} removed successfully (was IPv4={client.ipv4}, IPv6={client.ipv6})")
             console.print(f"[green]Successfully removed client {name}[/green]")
 
         except Exception as e:
-            logger.error(f"Failed to remove client: {e}")
+            logger.error(f"Failed to remove client {name}: {e}")
             raise
 
     def _get_all_client_status(self) -> dict:
@@ -1644,6 +1701,7 @@ For more info: https://github.com/iandk/wgm
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("-c", "--config", default="config.yaml", help="Path to config file")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose/debug output")
 
     subparsers = parser.add_subparsers(
         dest="command",
@@ -1752,6 +1810,10 @@ For more info: https://github.com/iandk/wgm
     )
 
     args = parser.parse_args()
+
+    # Enable verbose logging to file if requested (overrides config log_level)
+    if args.verbose:
+        file_handler.setLevel(logging.DEBUG)
 
     # Default to 'list' command if no command specified
     if not args.command:

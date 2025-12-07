@@ -49,3 +49,7 @@ dns_overrides:
 # Whether dnsmasq should read /etc/hosts for DNS resolution
 # true = read /etc/hosts (default), false = ignore /etc/hosts (VPN-only DNS)
 dnsmasq_read_etc_hosts: true
+
+# Log level for file logging (/var/log/wgm.log)
+# Options: DEBUG, INFO, WARNING, ERROR (default: INFO)
+log_level: INFO
