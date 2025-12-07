@@ -1505,7 +1505,7 @@ nameserver 1.1.1.1
         if not restrictions:
             return None
         
-        return f"Restricted to: {", ".join(restrictions)}"
+        return "Restricted to: " + ", ".join(restrictions)
 
         
     def _get_client_tunnel_mode(self, client) -> str:
