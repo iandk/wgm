@@ -285,6 +285,113 @@ class WireGuardManager:
         except Exception as e:
             logger.warning(f"Failed to check config changes: {e}")
 
+    def validate_config(self) -> List[str]:
+        """Validate configuration and return list of errors (empty if valid)."""
+        errors = []
+
+        # Validate IPv4 subnet
+        try:
+            ipaddress.ip_network(self.config.ipv4_subnet)
+        except ValueError as e:
+            errors.append(f"Invalid ipv4_subnet '{self.config.ipv4_subnet}': {e}")
+
+        # Validate IPv6 subnet
+        try:
+            ipaddress.ip_network(self.config.ipv6_subnet)
+        except ValueError as e:
+            errors.append(f"Invalid ipv6_subnet '{self.config.ipv6_subnet}': {e}")
+
+        # Validate server port
+        if not (1 <= self.config.server_port <= 65535):
+            errors.append(f"Invalid server_port '{self.config.server_port}': must be 1-65535")
+
+        # Validate endpoint (should be IP or hostname)
+        if self.config.endpoint:
+            # Try as IP first
+            try:
+                ipaddress.ip_address(self.config.endpoint)
+            except ValueError:
+                # Not an IP, check if it looks like a valid hostname
+                if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$', self.config.endpoint):
+                    errors.append(f"Invalid endpoint '{self.config.endpoint}': must be IP address or hostname")
+
+        # Validate dns_overrides format
+        if self.config.dns_overrides:
+            if not isinstance(self.config.dns_overrides, dict):
+                errors.append(f"Invalid dns_overrides: must be a dictionary (hostname: ip)")
+            else:
+                for domain, ip in self.config.dns_overrides.items():
+                    try:
+                        ipaddress.ip_address(ip)
+                    except ValueError:
+                        errors.append(f"Invalid IP '{ip}' for dns_override domain '{domain}'")
+
+        # Validate directories exist or can be created
+        for dir_name, dir_path in [('config_dir', self.config.config_dir), ('qr_dir', self.config.qr_dir)]:
+            path = Path(dir_path)
+            if not path.exists():
+                try:
+                    path.mkdir(parents=True, exist_ok=True)
+                except PermissionError:
+                    errors.append(f"Cannot create {dir_name} '{dir_path}': permission denied")
+
+        # Validate server keys exist
+        if not self.config.server_private_key:
+            errors.append("Missing server_private_key")
+        if not self.config.server_public_key:
+            errors.append("Missing server_public_key")
+
+        return errors
+
+    def apply_config(self) -> bool:
+        """Validate and apply configuration changes. Returns True on success."""
+        console.print("[cyan]Validating configuration...[/cyan]")
+
+        # Run validation
+        errors = self.validate_config()
+        if errors:
+            console.print("[red]Configuration validation failed:[/red]")
+            for error in errors:
+                console.print(f"  [red]• {error}[/red]")
+            return False
+
+        console.print("[green]✓ Configuration valid[/green]")
+
+        # Force update by clearing the hash
+        if self.config_hash_file.exists():
+            self.config_hash_file.unlink()
+
+        # Re-run the config change check which will apply everything
+        console.print("[cyan]Applying configuration...[/cyan]")
+
+        # Update resolv.conf
+        self._update_resolv_conf()
+        console.print("[green]✓ Updated /etc/resolv.conf[/green]")
+
+        # Update DNS config (dnsmasq)
+        if self.clients:
+            self._update_dns_config()
+            console.print("[green]✓ Updated dnsmasq configuration[/green]")
+
+            # Regenerate client configs
+            self._regenerate_client_configs()
+        else:
+            # Still update dnsmasq for dns_overrides even without clients
+            self._update_dns_config()
+            console.print("[green]✓ Updated dnsmasq configuration[/green]")
+            console.print("[yellow]No clients to regenerate[/yellow]")
+
+        # Update server config
+        self._update_server_config()
+        console.print("[green]✓ Updated WireGuard server configuration[/green]")
+
+        # Save new hash
+        current_hash = self._compute_config_hash()
+        self.config_hash_file.write_text(current_hash)
+
+        console.print("\n[green bold]Configuration applied successfully![/green bold]")
+        return True
+
     def _regenerate_client_configs(self) -> None:
         """Regenerate all client configuration files with updated endpoint/domain."""
         try:
@@ -1603,6 +1710,13 @@ For more info: https://github.com/iandk/wgm
         description="Show all clients with status, addresses, tunnel mode, and restrictions"
     )
 
+    # Apply config command
+    subparsers.add_parser(
+        "apply",
+        help="Apply configuration changes",
+        description="Validate and apply config.yaml changes (DNS, dnsmasq, client configs)"
+    )
+
     # Manage restrictions command
     restrict_parser = subparsers.add_parser(
         "restrict",
@@ -1682,6 +1796,10 @@ For more info: https://github.com/iandk/wgm
 
         elif args.command == "list":
             manager.list_clients()
+
+        elif args.command == "apply":
+            if not manager.apply_config():
+                sys.exit(1)
 
         elif args.command == "restrict":
             if not any([args.allow, args.deny, args.clear]):
