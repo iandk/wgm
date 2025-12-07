@@ -1138,6 +1138,15 @@ class WireGuardManager:
 
             logger.info(f"Updating /etc/resolv.conf with DNS domain: {dns_domain}")
 
+            resolv_path = Path('/etc/resolv.conf')
+
+            # Handle broken symlinks (e.g., systemd-resolved not running)
+            if resolv_path.is_symlink():
+                target = resolv_path.resolve()
+                if not target.exists():
+                    logger.info(f"Removing broken symlink {resolv_path} -> {os.readlink(resolv_path)}")
+                    resolv_path.unlink()
+
             # Remove immutable flag if present
             subprocess.run(['chattr', '-i', '/etc/resolv.conf'],
                          stderr=subprocess.DEVNULL, check=False)
@@ -1147,7 +1156,7 @@ class WireGuardManager:
 search {dns_domain}
 nameserver 1.1.1.1
 """
-            Path('/etc/resolv.conf').write_text(resolv_conf_content)
+            resolv_path.write_text(resolv_conf_content)
 
             # Make it immutable
             subprocess.run(['chattr', '+i', '/etc/resolv.conf'],
