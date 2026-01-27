@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import subprocess
 import ipaddress
+import re
 from pathlib import Path
 import qrcode
 import base64
@@ -393,22 +394,20 @@ class WireGuardManager:
         self._update_resolv_conf()
         console.print("[green]✓ Updated /etc/resolv.conf[/green]")
 
-        # Update DNS config (dnsmasq)
-        if self.clients:
-            self._update_dns_config()
-            console.print("[green]✓ Updated dnsmasq configuration[/green]")
-
-            # Regenerate client configs
-            self._regenerate_client_configs()
-        else:
-            # Still update dnsmasq for dns_overrides even without clients
-            self._update_dns_config()
-            console.print("[green]✓ Updated dnsmasq configuration[/green]")
-            console.print("[yellow]No clients to regenerate[/yellow]")
-
-        # Update server config
+        # Update server config FIRST - this brings up wg0 interface
+        # DNS config needs wg0 to be up so dnsmasq can bind to it
         self._update_server_config()
         console.print("[green]✓ Updated WireGuard server configuration[/green]")
+
+        # Update DNS config (dnsmasq) - now wg0 is up
+        self._update_dns_config()
+        console.print("[green]✓ Updated dnsmasq configuration[/green]")
+
+        # Regenerate client configs if any exist
+        if self.clients:
+            self._regenerate_client_configs()
+        else:
+            console.print("[yellow]No clients to regenerate[/yellow]")
         logger.info("Configuration applied successfully")
 
         # Save new hash
@@ -1217,14 +1216,12 @@ nameserver 1.1.1.1
             if self.config.dnsmasq_read_etc_hosts:
                 self._check_hosts_conflicts()
 
-            # Wait for WireGuard interface to be up
-            retries = 5
-            while retries > 0 and not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
-                time.sleep(1)
-
+            # Verify WireGuard interface is up (should be brought up by _update_server_config)
             if not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
-                logger.warning(f"WireGuard interface {self.config.wg_interface} not found")
-                return
+                raise RuntimeError(
+                    f"WireGuard interface {self.config.wg_interface} is not up. "
+                    f"Run 'wg-quick up {self.config.wg_interface}' or 'wgm apply' to bring it up."
+                )
 
             # Install dnsmasq if not present
             if not Path('/usr/sbin/dnsmasq').exists():
