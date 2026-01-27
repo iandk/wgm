@@ -228,7 +228,7 @@ client_mtu: 1320  # Included in generated client configs
 | Value | Use Case |
 |-------|----------|
 | 1420  | Standard WireGuard (single hop) - default if not set |
-| 1320  | Hub-and-spoke topology (traffic between peers via server) |
+| 1320  | Hub-and-spoke topology, or mobile networks (safe universal default) |
 | 1280  | Maximum compatibility (IPv6 minimum MTU) |
 
 **When to use:**
@@ -239,3 +239,38 @@ client_mtu: 1320  # Included in generated client configs
 Each WireGuard hop adds ~60 bytes overhead. With double encapsulation, the effective payload drops to ~1300 bytes while TCP negotiates a higher MSS, causing packets to be silently dropped.
 
 After changing MTU, run `wgm apply` to update the server configuration.
+
+### MTU Troubleshooting
+
+**Why PMTUD fails on mobile networks:**
+
+Mobile carriers (LTE/5G) often filter ICMP "fragmentation needed" messages, creating a PMTU black hole. Without these messages, clients never learn the correct path MTU and keep sending oversized packets that get silently dropped.
+
+**Finding optimal MTU:**
+
+Use the included script to discover the best MTU for your network:
+
+```bash
+# Run from a connected WireGuard client
+./find-mtu.sh 10.99.99.1
+```
+
+The script uses binary search to find the maximum working payload size, then calculates the optimal MTU.
+
+**What doesn't fix it:**
+| Approach | Why It Fails |
+|----------|--------------|
+| `--clamp-mss-to-pmtu` | Relies on PMTUD which is broken |
+| `tcp_mtu_probing` | Helps established TCP but not TLS handshake |
+| Server-side MTU only | Doesn't affect client's outbound path |
+
+**Quick diagnostics:**
+```bash
+# Test if large packets work (inside tunnel)
+ping -M do -s 1380 10.99.99.1   # Linux
+ping -D -s 1380 10.99.99.1      # macOS
+
+# Check current WireGuard MTU
+ip link show wg0 | grep mtu     # Linux
+ifconfig utun9 | grep mtu       # macOS
+```
