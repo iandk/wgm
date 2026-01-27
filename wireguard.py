@@ -1216,12 +1216,16 @@ nameserver 1.1.1.1
             if self.config.dnsmasq_read_etc_hosts:
                 self._check_hosts_conflicts()
 
-            # Verify WireGuard interface is up (should be brought up by _update_server_config)
+            # Wait briefly for WireGuard interface to be up
+            retries = 3
+            while retries > 0 and not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
+                time.sleep(1)
+                retries -= 1
+
             if not Path(f"/sys/class/net/{self.config.wg_interface}").exists():
-                raise RuntimeError(
-                    f"WireGuard interface {self.config.wg_interface} is not up. "
-                    f"Run 'wg-quick up {self.config.wg_interface}' or 'wgm apply' to bring it up."
-                )
+                logger.warning(f"WireGuard interface {self.config.wg_interface} not found, skipping DNS update")
+                console.print(f"[yellow]⚠ WireGuard interface not up, skipping DNS configuration[/yellow]")
+                return
 
             # Install dnsmasq if not present
             if not Path('/usr/sbin/dnsmasq').exists():
@@ -1275,11 +1279,19 @@ nameserver 1.1.1.1
             for client in self.clients.values():
                 client_ip = client.ipv4.split('/')[0]
                 client_ip6 = client.ipv6.split('/')[0]
-                # Use short names - expand-hosts will automatically add domain suffix
+                # Add short name
                 hosts_lines.extend([
                     f"{client_ip} {client.name}",
                     f"{client_ip6} {client.name}"
                 ])
+                # If name contains a dot, also add FQDN explicitly
+                # (expand-hosts only works for simple names without dots)
+                if '.' in client.name:
+                    fqdn = f"{client.name}.{dns_domain}"
+                    hosts_lines.extend([
+                        f"{client_ip} {fqdn}",
+                        f"{client_ip6} {fqdn}"
+                    ])
             hosts_lines.append('')  # End with newline
 
             # Clean up old config files
