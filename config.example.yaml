@@ -13,6 +13,16 @@ wg_interface: 'wg0'
 # WireGuard server port
 server_port: 51820
 
+# WireGuard interface MTU (optional)
+# If not set, WireGuard uses its default (typically 1420)
+# Recommended values:
+#   1420 - Standard WireGuard (single hop)
+#   1320 - Hub-and-spoke topology (double WireGuard encapsulation)
+#   1280 - Maximum compatibility (IPv6 minimum MTU)
+# Lower MTU avoids fragmentation issues when PMTU discovery is broken
+# server_mtu: 1320  # MTU for server's wg0 interface
+# client_mtu: 1320  # MTU included in generated client configs
+
 # Directory for WireGuard configuration files
 config_dir: '/etc/wireguard'
 

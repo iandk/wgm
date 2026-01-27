@@ -69,6 +69,8 @@ class WireGuardConfig:
     dns_overrides: Dict[str, str] = field(default_factory=dict)
     dnsmasq_read_etc_hosts: bool = True
     log_level: str = 'INFO'
+    server_mtu: Optional[int] = None
+    client_mtu: Optional[int] = None
 
     @classmethod
     def from_dict(cls, config_dict: Dict) -> 'WireGuardConfig':
@@ -327,6 +329,14 @@ class WireGuardManager:
         # Validate server port
         if not (1 <= self.config.server_port <= 65535):
             errors.append(f"Invalid server_port '{self.config.server_port}': must be 1-65535")
+
+        # Validate MTU values if set
+        if self.config.server_mtu is not None:
+            if not (1280 <= self.config.server_mtu <= 1500):
+                errors.append(f"Invalid server_mtu '{self.config.server_mtu}': must be 1280-1500")
+        if self.config.client_mtu is not None:
+            if not (1280 <= self.config.client_mtu <= 1500):
+                errors.append(f"Invalid client_mtu '{self.config.client_mtu}': must be 1280-1500")
 
         # Validate endpoint (should be IP or hostname)
         if self.config.endpoint:
@@ -780,6 +790,13 @@ class WireGuardManager:
                 f'PrivateKey = {self.config.server_private_key}',
                 f'Address = {self._get_server_ips()}',
                 f'ListenPort = {self.config.server_port}',
+            ]
+
+            # Add MTU if configured
+            if self.config.server_mtu:
+                config_lines.append(f'MTU = {self.config.server_mtu}')
+
+            config_lines.extend([
                 '# Enable IP forwarding, return traffic, and NAT',
                 'PostUp = sysctl -w net.ipv4.ip_forward=1; '
                 'sysctl -w net.ipv6.conf.all.forwarding=1; '
@@ -796,7 +813,7 @@ class WireGuardManager:
                 f'ip6tables -t nat -D POSTROUTING -s {self.config.ipv6_subnet} -d {self.config.ipv6_subnet} -o %i -j MASQUERADE; '
                 f'iptables -t nat -D POSTROUTING -o {self.config.interface_name} -j MASQUERADE; '
                 f'ip6tables -t nat -D POSTROUTING -o {self.config.interface_name} -j MASQUERADE'
-            ]
+            ])
 
             # Add peer configs if any clients exist
             if self.clients:
@@ -1411,6 +1428,10 @@ nameserver 1.1.1.1
             f'Address = {client.ipv4}, {client.ipv6}',
             f'DNS = {server_ip}',  # Point to WireGuard server for DNS
         ]
+
+        # Add MTU if configured
+        if self.config.client_mtu:
+            config_lines.append(f'MTU = {self.config.client_mtu}')
 
         # Add PostUp/PreDown for excluding public IPs in full tunnel mode
         if exclude_public_ips and "0.0.0.0/0" in client.allowed_ips:
