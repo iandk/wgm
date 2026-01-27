@@ -79,6 +79,7 @@ install_dependencies() {
         dnsmasq
         bc
         dnsutils
+        bash-completion
     )
 
     apt-get install -y "${packages[@]}" || error "Failed to install dependencies"
@@ -180,6 +181,23 @@ create_config() {
     fi
 }
 
+setup_bash_completion() {
+    log "Installing bash completion..."
+
+    local completion_dir="/etc/bash_completion.d"
+    local completion_src="/opt/wgm/completions/wgm.bash"
+
+    if [[ ! -f "$completion_src" ]]; then
+        warn "Completion script not found at $completion_src"
+        return
+    fi
+
+    mkdir -p "$completion_dir"
+    ln -sf "$completion_src" "$completion_dir/wgm"
+
+    log "Bash completion installed. Run 'source /etc/bash_completion.d/wgm' or start a new shell."
+}
+
 main() {
     log "Starting WireGuard Manager installation..."
 
@@ -191,6 +209,7 @@ main() {
     disable_systemd_resolved
     restart_services
     create_config
+    setup_bash_completion
 
     # Update resolv.conf after config is created (in case dns_domain is customized)
     update_resolv_conf
