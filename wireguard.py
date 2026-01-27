@@ -771,14 +771,8 @@ class WireGuardManager:
         try:
             logger.debug(f"Updating WireGuard server config for interface {self.config.wg_interface}")
 
-            # First try to clean up existing interface
-            if Path(f"/sys/class/net/{self.config.wg_interface}").exists():
-                try:
-                    # Stop interface if running
-                    logger.debug(f"Bringing down existing interface {self.config.wg_interface}")
-                    self._run_command(['wg-quick', 'down', self.config.wg_interface])
-                except Exception as e:
-                    logger.warning(f"Failed to bring down interface: {e}")
+            # Check if interface already exists
+            interface_exists = Path(f"/sys/class/net/{self.config.wg_interface}").exists()
 
             # Build server config
             config_lines = [
@@ -826,9 +820,37 @@ class WireGuardManager:
             # Flush all old FORWARD rules before adding new ones
             self._flush_forward_rules()
 
-            # Start interface
-            logger.debug(f"Bringing up interface {self.config.wg_interface}")
-            self._run_command(['wg-quick', 'up', self.config.wg_interface])
+            if interface_exists:
+                # Hot-reload peers without restarting interface (no client disruption)
+                logger.debug(f"Hot-reloading interface {self.config.wg_interface} with wg syncconf")
+                # Create stripped config for syncconf (no Address/DNS/PostUp/PostDown)
+                syncconf_lines = [
+                    '[Interface]',
+                    f'PrivateKey = {self.config.server_private_key}',
+                    f'ListenPort = {self.config.server_port}',
+                ]
+                if self.clients:
+                    for client in self.clients.values():
+                        syncconf_lines.extend([
+                            '',
+                            '[Peer]',
+                            f'PublicKey = {client.public_key}',
+                            f'AllowedIPs = {client.ipv4.split("/")[0]}/32, {client.ipv6.split("/")[0]}/128',
+                            'PersistentKeepalive = 25'
+                        ])
+                syncconf_lines.append('')
+                # Write temp file and syncconf
+                syncconf_path = Path(self.config.config_dir) / f".{self.config.wg_interface}_syncconf.conf"
+                syncconf_path.write_text('\n'.join(syncconf_lines))
+                syncconf_path.chmod(0o600)
+                try:
+                    self._run_command(['wg', 'syncconf', self.config.wg_interface, str(syncconf_path)])
+                finally:
+                    syncconf_path.unlink(missing_ok=True)
+            else:
+                # First time: bring up interface with wg-quick
+                logger.debug(f"Bringing up interface {self.config.wg_interface}")
+                self._run_command(['wg-quick', 'up', self.config.wg_interface])
 
             # IMPORTANT: Add restricted client rules FIRST (before unrestricted)
             # This ensures DROP rules are evaluated before broad ACCEPT rules
