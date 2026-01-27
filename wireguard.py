@@ -435,7 +435,8 @@ class WireGuardManager:
                 private_key = None
                 for line in config_content.split('\n'):
                     if line.startswith('PrivateKey'):
-                        private_key = line.split('=')[1].strip()
+                        # Use split with maxsplit=1 to preserve '=' in base64 keys
+                        private_key = line.split('=', 1)[1].strip()
                         break
 
                 if not private_key:
@@ -994,8 +995,9 @@ class WireGuardManager:
             f"systemctl enable wg-quick@{interface_name} && "
             f"wg-quick up {interface_name} && "
 
-            # Step 6: cleanup temporary DNS (remove both 1.1.1.1 and 8.8.8.8)
+            # Step 6: move fallback DNS from head to tail (so VPN DNS comes first, fallback second)
             f"sed -i '/^nameserver 1\\.1\\.1\\.1$/d' /etc/resolvconf/resolv.conf.d/head 2>/dev/null || true && "
+            f"echo 'nameserver 1.1.1.1' > /etc/resolvconf/resolv.conf.d/tail && "
             f"resolvconf -u"
         )
 
