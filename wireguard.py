@@ -1589,6 +1589,43 @@ nameserver 1.1.1.1
             logger.error(f"Failed to remove client {name}: {e}")
             raise
 
+    def _parse_handshake_time(self, time_str: str) -> Optional[int]:
+        """Parse WireGuard handshake time string to total seconds.
+
+        Examples:
+            "13 seconds ago" -> 13
+            "1 minute, 20 seconds ago" -> 80
+            "3 days, 21 hours, 46 minutes, 42 seconds ago" -> 339942
+
+        Returns:
+            Total seconds, or None if parsing fails
+        """
+        try:
+            # Remove "ago" suffix and split by comma
+            time_str = time_str.replace(' ago', '').strip()
+            parts = [p.strip() for p in time_str.split(',')]
+
+            total_seconds = 0
+            for part in parts:
+                tokens = part.split()
+                if len(tokens) >= 2:
+                    value = int(tokens[0])
+                    unit = tokens[1].lower()
+
+                    if 'day' in unit:
+                        total_seconds += value * 86400  # 24 * 60 * 60
+                    elif 'hour' in unit:
+                        total_seconds += value * 3600   # 60 * 60
+                    elif 'minute' in unit:
+                        total_seconds += value * 60
+                    elif 'second' in unit:
+                        total_seconds += value
+
+            return total_seconds
+        except Exception as e:
+            logger.debug(f"Failed to parse handshake time '{time_str}': {e}")
+            return None
+
     def _get_all_client_status(self) -> dict:
         """Get status information for all clients from wg command."""
         try:
@@ -1605,7 +1642,9 @@ nameserver 1.1.1.1
                     handshake_time = line.split(':')[1].strip()
                     if handshake_time != 'Never':
                         # Consider client online if last handshake was within 3 minutes
-                        if 'minutes' not in handshake_time or int(handshake_time.split()[0]) <= 3:
+                        # Parse the time string to get total seconds
+                        total_seconds = self._parse_handshake_time(handshake_time)
+                        if total_seconds is not None and total_seconds <= 180:  # 3 minutes
                             peer_info[current_peer]['status'] = 'Online'
                         peer_info[current_peer]['last_seen'] = handshake_time
 
