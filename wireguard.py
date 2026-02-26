@@ -1482,7 +1482,7 @@ nameserver 1.1.1.1
 
         return '\n'.join(config_lines)
 
-    def show_client_config(self, name: str, config_content: Optional[str] = None, show_qr: bool = False) -> None:
+    def show_client_config(self, name: str, config_content: Optional[str] = None, show_qr: bool = True) -> None:
         """Show configuration details for a client.
 
         Args:
@@ -1845,9 +1845,9 @@ For more info: https://github.com/iandk/wgm
     )
     config_parser.add_argument("name", help="Client name")
     config_parser.add_argument(
-        "--show-qr", "--qrcode",
+        "--no-qr",
         action="store_true",
-        help="Show QR code in terminal (for mobile devices)"
+        help="Hide QR code from terminal output"
     )
 
     # Remove client command
@@ -1953,7 +1953,7 @@ For more info: https://github.com/iandk/wgm
                 manager.add_client(args.name, full_tunnel, exclude_ip=args.exclude_ip, exclude_public_ips=args.exclude_public_ips)
 
         elif args.command == "config":
-            manager.show_client_config(args.name, show_qr=args.show_qr)
+            manager.show_client_config(args.name, show_qr=not args.no_qr)
 
         elif args.command == "remove":
             manager.remove_client(args.name, skip_confirm=args.yes)
