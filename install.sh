@@ -96,6 +96,11 @@ setup_symlink() {
     ln -sf /opt/wgm/wireguard.py /usr/local/bin/wgm
 }
 
+enable_wireguard() {
+    log "Enabling WireGuard to start at boot..."
+    systemctl enable wg-quick@wg0
+}
+
 configure_dnsmasq() {
     log "Configuring dnsmasq to depend on WireGuard..."
 
@@ -104,7 +109,8 @@ configure_dnsmasq() {
     cat > /etc/systemd/system/dnsmasq.service.d/override.conf << 'EOF'
 [Unit]
 After=wg-quick@wg0.service network-online.target
-Wants=wg-quick@wg0.service network-online.target
+Requires=wg-quick@wg0.service
+Wants=network-online.target
 Before=
 [Install]
 WantedBy=multi-user.target
@@ -205,6 +211,7 @@ main() {
     check_distribution
     install_dependencies
     setup_symlink
+    enable_wireguard
     configure_dnsmasq
     disable_systemd_resolved
     restart_services

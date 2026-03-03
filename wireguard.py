@@ -242,7 +242,7 @@ class WireGuardManager:
             sys.exit(1)
 
     def _ensure_interface_ready(self, config: WireGuardConfig) -> None:
-        """Ensure WireGuard interface and basic networking is configured."""
+        """Ensure WireGuard interface is up and basic networking is configured."""
         try:
             # Enable IP forwarding if not already enabled
             ipv4_forward = Path('/proc/sys/net/ipv4/ip_forward').read_text().strip()
@@ -261,6 +261,17 @@ class WireGuardManager:
                     "net.ipv4.ip_forward=1\n"
                     "net.ipv6.conf.all.forwarding=1\n"
                 )
+
+            # Bring up WireGuard interface if it's not running
+            if not Path(f"/sys/class/net/{config.wg_interface}").exists():
+                wg_conf = Path(config.config_dir) / f"{config.wg_interface}.conf"
+                if wg_conf.exists():
+                    console.print(f"[yellow]WireGuard interface {config.wg_interface} is down, bringing it up...[/yellow]")
+                    logger.info(f"WireGuard interface {config.wg_interface} not found, bringing up")
+                    self._run_command(['wg-quick', 'up', config.wg_interface])
+                    console.print(f"[green]WireGuard interface {config.wg_interface} is up[/green]")
+                    logger.info(f"WireGuard interface {config.wg_interface} brought up successfully")
+
         except Exception as e:
             logger.warning(f"Could not ensure interface ready: {e}")
 
