@@ -166,9 +166,17 @@ disable_systemd_resolved() {
 }
 
 restart_services() {
-    log "Reloading systemd and restarting dnsmasq..."
+    log "Reloading systemd..."
     systemctl daemon-reload
-    systemctl restart dnsmasq || error "Failed to restart dnsmasq"
+
+    # On fresh install, wg0.conf doesn't exist yet (created on first 'wgm' run).
+    # dnsmasq Requires= wg0, so only restart if WireGuard is configured.
+    if [[ -f /etc/wireguard/wg0.conf ]]; then
+        log "Restarting dnsmasq..."
+        systemctl restart dnsmasq || error "Failed to restart dnsmasq"
+    else
+        log "WireGuard not yet configured — dnsmasq will start after first 'wgm' run"
+    fi
 }
 
 create_config() {
